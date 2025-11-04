@@ -1,0 +1,2911 @@
+diff --git a/vllm/config.py b/vllm/config.py
+index 8a2f7f7..a21b4fa 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -3328,7 +3328,14 @@ class VllmConfig:
+     # tree config registration.
+     additional_config: SupportsHash = field(default=None,
+                                             init=True)  # type: ignore
++    """Additional config for specified platform. Different platforms may
++    support different configs. Make sure the configs are valid for the platform
++    you are using. Contents must be hashable."""
++    enable_auto_pd_offload: bool = False
++    """Enable automatic PD offload to shared memory."""
+     instance_id: str = ""
++    """The ID of the vLLM instance."""
++
+ 
+     def compute_hash(self) -> str:
+         """
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index 1966eac..a43f8bc 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -290,7 +290,14 @@ class BlockList:
+         return self._blocks
+ 
+     def ids(self) -> List[int]:
+-        return self._block_ids
++        # 对block_ids进行去重，保持原有顺序
++        seen = set()
++        result = []
++        for block_id in self._block_ids:
++            if block_id not in seen:
++                seen.add(block_id)
++                result.append(block_id)
++        return result
+ 
+ 
+ @dataclass
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index cf85a21..26653fe 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -18,8 +18,9 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
+ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
+                            SequenceGroupBase, SequenceGroupMetadata,
+                            SequenceGroupMetadataDelta, SequenceStage,
+-                           SequenceStatus)
++                           SequenceStatus, SequenceStage)
+ from vllm.utils import Device, PyObjectCache
++from vllm.core.shared_memory import SharedMemoryManager
+ 
+ logger = init_logger(__name__)
+ 
+@@ -431,6 +432,7 @@ class Scheduler:
+         lora_config: Optional[LoRAConfig],
+         pipeline_parallel_size: int = 1,
+         output_proc_callback: Optional[Callable] = None,
++        shared_memory_manager: Optional[SharedMemoryManager] = None
+     ) -> None:
+         self.scheduler_config = scheduler_config
+         self.cache_config = cache_config
+@@ -438,6 +440,11 @@ class Scheduler:
+         # simple and NOT fair. It can lead to starvation of some
+         # LoRAs. This should be improved in the future.
+         self.lora_config = lora_config
++        # 保存共享内存管理器引用
++        self.shared_memory_manager: Optional[SharedMemoryManager] = shared_memory_manager
++        self.device = "gpu"
++        if cache_config.num_cpu_blocks == 0:
++            self.device = "cpu"
+ 
+         version = "selfattn"
+         if (self.scheduler_config.runner_type == "pooling"
+@@ -550,6 +557,18 @@ class Scheduler:
+ 
+     def add_seq_group(self, seq_group: SequenceGroup) -> None:
+         # Add sequence groups to the waiting queue.
++
++        # 检查PD分离请求是否在未启用自动PD卸载时被接收
++        if self.shared_memory_manager is None:
++            sampling_params = seq_group.sampling_params
++            if (sampling_params is not None and
++                (sampling_params.request_id_inference is not None or
++                 sampling_params.num_decode_tokens is not None)):
++                raise ValueError(
++                    "PD分离请求被拒绝：未启用自动PD卸载功能。"
++                    "请使用 --enable-auto-pd-offload 参数启动服务。"
++                )
++
+         self.waiting.append(seq_group)
+ 
+     def _add_seq_group_to_running(self, seq_group: SequenceGroup) -> None:
+@@ -631,6 +650,41 @@ class Scheduler:
+         return (len(self.waiting) != 0 or len(self.running) != 0
+                 or len(self.swapped) != 0)
+ 
++    def has_unfinished_seqs_for_sysHAX(self) -> bool:
++        """
++        判断是否还有未完成的请求需要继续处理。
++
++        对于GPU/CPU混合部署方案，需要考虑以下情况：
++        1. running队列中有待执行的decode任务
++        2. swapped队列中有待交换回来的任务
++        3. waiting队列中有未处理的任务，包括两种情况：
++           a. 原生vLLM任务（request_id_inference为None且num_decode_tokens为None）
++           b. 接力decode任务（request_id_inference不为None的任务）
++           c. PD分离任务（request_id_inference为None但num_decode_tokens不为None）
++
++        Returns:
++            bool: 如果有任何未完成任务返回True，否则返回False
++        """
++        # 检查running和swapped队列
++        if len(self.running) != 0 or len(self.swapped) != 0:
++            return True
++
++        # 检查waiting队列中是否有需要处理的任务
++        for seq_group in self.waiting:
++            sp = seq_group.sampling_params
++            # 原生vLLM逻辑：无 sampling_params 或 request_id_inference 和 num_decode_tokens 都为 None
++            if sp is None or (sp.request_id_inference is None and sp.num_decode_tokens is None):
++                return True
++            # 接力decode任务：sampling_params 存在且 request_id_inference 不为 None
++            if sp is not None and sp.request_id_inference is not None:
++                return True
++            # PD 分离任务：sampling_params 存在，request_id_inference 为 None 且 num_decode_tokens 不为 None
++            if sp is not None and sp.request_id_inference is None and sp.num_decode_tokens is not None:
++                return True
++
++        # 所有任务都已处理完毕
++        return False
++
+     def get_prefix_cache_hit_rate(self, device: Device) -> float:
+         return self.block_manager.get_prefix_cache_hit_rate(device)
+ 
+@@ -1498,6 +1552,11 @@ class Scheduler:
+         # such as self.running, self.swapped, and self.waiting.
+         scheduler_start_time = time.perf_counter()
+ 
++        if self.shared_memory_manager is not None:
++            self._seq_load_kvcache()
++            self._seq_preprocessing_queue()
++            self._prioritize_pd_prefill()
++
+         scheduler_outputs: SchedulerOutputs = self._schedule()
+         now = time.time()
+ 
+@@ -1684,6 +1743,24 @@ class Scheduler:
+ 
+         self.running = remaining
+ 
++        # AUTO_PD_OFFLOAD: 处理swapped队列中的已完成序列
++        if self.shared_memory_manager is not None:
++            swapped_remaining: Deque[SequenceGroup] = deque()
++            for seq_group in self.swapped:
++                self._free_finished_seq_group(seq_group)
++                if not seq_group.is_finished():
++                    swapped_remaining.append(seq_group)
++                else:
++                    # 清理AUTO_PD_OFFLOAD相关的映射数据
++                    if hasattr(seq_group, 'auto_pd_offload_mapping'):
++                        delattr(seq_group, 'auto_pd_offload_mapping')
++                    # 清理处理标记
++                    if hasattr(seq_group, '_auto_pd_offload_processed'):
++                        delattr(seq_group, '_auto_pd_offload_processed')
++                    logger.debug(f"AUTO_PD_OFFLOAD: 序列组 {seq_group.request_id} 已从swapped队列中完成并清理")
++
++            self.swapped = swapped_remaining
++
+         # Handle async stopped sequence groups
+         # (ones that reached max model len)
+         if self._async_stopped:
+@@ -1803,6 +1880,31 @@ class Scheduler:
+         seq_group: SequenceGroup,
+         blocks_to_swap_out: List[Tuple[int, int]],
+     ) -> None:
++        # AUTO_PD_OFFLOAD: 在swap out之前处理KV cache上传
++        if self.shared_memory_manager is not None:
++
++            try:
++                # 获取物理块映射（在swap out之前）
++                kv_cache_mapping = {}
++                running_seqs = seq_group.get_seqs(
++                    status=SequenceStatus.RUNNING)
++
++                for seq in running_seqs:
++                    if seq.seq_id in self.block_manager.block_tables:
++                        block_table = self.block_manager.block_tables[seq.seq_id]
++                        physical_block_ids = block_table.physical_block_ids
++                        if physical_block_ids:
++                            kv_cache_mapping[seq.seq_id] = physical_block_ids.copy(
++                            )
++
++                if kv_cache_mapping:
++                    # 存储物理块映射到序列组，供后续使用
++                    seq_group.auto_pd_offload_mapping = kv_cache_mapping
++                    logger.info("\033[0;32m" + f"AUTO_PD_OFFLOAD: 为序列组 {seq_group.request_id} 预存储物理块映射" + "\033[0m")
++
++            except Exception as e:
++                logger.error(f"AUTO_PD_OFFLOAD预处理失败: {e}")
++
+         self._swap_out(seq_group, blocks_to_swap_out)
+ 
+     def _swap_in(
+@@ -2059,3 +2161,169 @@ class Scheduler:
+                              prefill_slot_budget)
+ 
+         return num_new_tokens
++
++    def store_kv_cache(self, seq_group: SequenceGroup, cpu_mapping: Dict[int, list[int]]) -> Dict[int, List[int]]:
++        assert self.shared_memory_manager is not None, "shared_memory_manager is None"
++
++        request_id = seq_group.request_id
++        if not cpu_mapping:
++            logger.warning(f"Warning, {request_id} 无有效块表，KV 缓存保存失败")
++            return {}
++
++        kv_cache_data = {
++            "physical_block_id_mapping": cpu_mapping,
++            "device": self.device,
++            "physical_blocks_meta": None,
++            "output_token_ids": None,
++        }
++        if self.shared_memory_manager.store_logical_block(request_id, kv_cache_data):
++            logger.debug(f"KV 缓存已存入共享内存 - request_id: {request_id}")
++            return cpu_mapping
++        else:
++            logger.warning(f"KV 缓存存入失败 - request_id: {request_id}")
++            return {}
++
++    def load_kv_cache(self, seq_group: SequenceGroup) -> Dict[int, List[int]]:
++        assert self.shared_memory_manager is not None, "shared_memory_manager is None"
++
++        request_id = seq_group.request_id
++        request_id_inference = seq_group.sampling_params.request_id_inference
++        logger.debug(f"开始准备加载KV缓存逻辑块 - 本次id: {request_id}, 继承id: {request_id_inference}")
++
++        # 仅对带有继承 id 的 decode 任务进行接力加载
++        if request_id_inference is not None:
++            kv_cache_data = self.shared_memory_manager.load_logical_block(
++                request_id_inference)
++
++            if kv_cache_data is not None:
++                raw_mapping = kv_cache_data.get(
++                    "physical_block_id_mapping", {})
++                int_mapping: Dict[int, List[int]] = {
++                    int(k): list(v) for k, v in raw_mapping.items()}
++
++                self.block_manager.allocate(seq_group=seq_group)
++                seqs = seq_group.get_seqs()
++                assert len(int_mapping) == len(
++                    seqs), f"读取序列数量 {len(int_mapping)} != 当前序列数量 {len(seqs)}"
++
++                sorted_keys = sorted(int_mapping.keys())
++                raw_output_ids = kv_cache_data.get("output_token_ids") or {}
++                int_output_ids: Dict[int, List[int]] = {
++                    int(k): v for k, v in raw_output_ids.items()}
++                block_mapping: Dict[int, List[int]] = {}
++
++                # 获取上一次保存时的设备类型
++                prev_device = kv_cache_data.get("device")
++                current_device = self.device
++
++                for idx, seq in enumerate(seqs):
++                    old_key = sorted_keys[idx]
++                    ids = int_mapping[old_key]
++                    tbl = self.block_manager.block_tables[seq.seq_id]
++                    inherited_tokens = int_output_ids.get(old_key, [])
++
++                    if prev_device == current_device:
++                        # 同设备接力（GPU->GPU 或 CPU->CPU）：直接覆盖底层块ID列表
++                        tbl._blocks._block_ids = ids.copy()
++                        block_mapping[seq.seq_id] = tbl.physical_block_ids.copy()
++                        seq.data.output_token_ids = inherited_tokens
++                        logger.debug(f"同设备接力 {prev_device}->{current_device}: 覆盖块ID列表")
++
++                    else:
++                        # 不同设备接力（GPU->CPU 或 CPU->GPU）：追加槽位
++                        if len(inherited_tokens) > 0:
++                            self.block_manager.append_slots(
++                                seq, len(inherited_tokens))
++                        block_mapping[seq.seq_id] = tbl.physical_block_ids.copy()
++
++                        original_prompt_len = len(seq.data.prompt_token_ids)
++                        seq.data.output_token_ids = inherited_tokens
++                        total_tokens = original_prompt_len + \
++                            len(inherited_tokens)
++                        seq.data.update_num_computed_tokens(total_tokens - 1)
++                        logger.debug(f"不同设备接力 {prev_device}->{current_device}: 追加槽位 {len(inherited_tokens)} 个token")
++                return block_mapping
++
++    def _seq_preprocessing_queue(self) -> None:
++        """
++        从 waiting 队列中提取带有 request_id_inference 的 decode 任务，并将其移入 running 队列。
++        """
++        waiting_queue = self.waiting
++        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
++
++        # waiting队列的任务会进行如下判断
++        # * 带有request_id_inference的任务为动态调度任务的decode阶段，不执行prefill，直接进入decode
++        while waiting_queue:
++            seq_group = waiting_queue[0]
++            waiting_queue.popleft()
++            sp = seq_group.sampling_params
++            if sp is not None and sp.request_id_inference is not None:
++                logger.info(
++                    "\033[0;32m" + f"发现decode接力任务: request_id={seq_group.request_id}" + "\033[0m")
++                self.running.append(seq_group)
++                for seq in seq_group.get_seqs():
++                    seq.status = SequenceStatus.RUNNING
++                    seq.data._stage = SequenceStage.DECODE
++            else:
++                leftover_waiting_sequences.appendleft(seq_group)
++        waiting_queue.extendleft(leftover_waiting_sequences)
++
++    def _prioritize_pd_prefill(self) -> None:
++        """
++        从 waiting 队列中提取带有 num_decode_tokens 且无 request_id_inference 的 prefill 任务，移动到 waiting 队列头部优先处理
++        """
++        for sg in list(self.waiting):
++            sp = sg.sampling_params
++            # PD 分离 prefill: sampling_params 存在，num_decode_tokens 不为 None 且 request_id_inference 为 None
++            if sp is not None and sp.num_decode_tokens is not None and sp.request_id_inference is None:
++                self.waiting.remove(sg)
++                self.waiting.appendleft(sg)
++
++    def _seq_load_kvcache(self) -> None:
++        """
++        对动态调度的任务保存kvcache
++        该动作发生在：
++            1. decode开始前读取kvcache
++        """
++        failed_kv_cache_load_requests: List[SequenceGroup] = [
++        ]  # 存储加载KV缓存失败的请求
++        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
++
++        waiting_queue = self.waiting
++        assert len(self._async_stopped) == 0
++        while waiting_queue:
++            seq_group = waiting_queue[0]
++            waiting_queue.popleft()
++
++            # 处理需要共享内存KV缓存的 decode 任务
++            sp = seq_group.sampling_params
++            if sp is not None and sp.request_id_inference is not None:
++                # 尝试从共享内存加载KV缓存
++                seq_group.physical_block_mapping = self.load_kv_cache(
++                    seq_group)
++                if len(seq_group.physical_block_mapping) == 0:
++                    request_id = seq_group.request_id
++                    request_id_inference = seq_group.sampling_params.request_id_inference
++                    logger.warning(
++                        f"Failed to load KV cache for request {request_id} from {request_id_inference}")
++
++                    # 将该任务添加到失败列表
++                    failed_kv_cache_load_requests.append(seq_group)
++                    continue
++            leftover_waiting_sequences.appendleft(seq_group)
++        waiting_queue.extendleft(leftover_waiting_sequences)
++
++        # 处理加载KV缓存失败的请求
++        for seq_group in failed_kv_cache_load_requests:
++            # 对于加载KV缓存失败的请求，sampling_params 不为 None 时重置其 request_id_inference，将其作为普通请求处理
++            if seq_group.sampling_params is not None:
++                seq_group.sampling_params.request_id_inference = None
++            logger.info(
++                f"重置请求 {seq_group.request_id} 的request_id_inference为None，将作为普通请求处理")
++            # 将请求放回waiting队列，但此时它将作为普通prefill请求处理
++            if seq_group.sampling_params is not None:
++                seq_group.sampling_params.num_decode_tokens = None
++                seq_group.sampling_params.request_id_inference = None
++            for seq in seq_group.get_seqs():
++                seq.status = SequenceStatus.WAITING
++            self.waiting.appendleft(seq_group)
+diff --git a/vllm/core/shared_memory/__init__.py b/vllm/core/shared_memory/__init__.py
+new file mode 100644
+index 0000000..7c237d2
+--- /dev/null
++++ b/vllm/core/shared_memory/__init__.py
+@@ -0,0 +1,7 @@
++"""共享内存模块，用于管理vLLM实例之间的共享内存通信。"""
++
++from vllm.core.shared_memory.manager import SharedMemoryManager
++
++__all__ = [
++    "SharedMemoryManager"
++]
+diff --git a/vllm/core/shared_memory/manager.py b/vllm/core/shared_memory/manager.py
+new file mode 100644
+index 0000000..bf28b31
+--- /dev/null
++++ b/vllm/core/shared_memory/manager.py
+@@ -0,0 +1,546 @@
++"""共享内存管理器模块，用于在GPU和CPU vLLM实例之间共享KV缓存信息。"""
++
++import contextlib
++import json
++import time
++from multiprocessing import shared_memory
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++import numpy as np
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class SharedMemoryManager:
++    """
++    管理vLLM实例之间的共享内存通信
++
++    此类负责处理GPU和CPU两个独立vLLM实例之间的通信和数据共享，
++    主要用于传递KV缓存的逻辑块与物理块映射信息，实现跨实例接力式推理。
++
++    支持四种不同运行环境：
++    1. GPU容器：负责创建请求映射表，作为服务端
++    2. CPU容器：连接请求映射表，作为客户端
++    3. GPU worker：使用GPU容器创建的映射表，export缓存
++    4. CPU worker：使用CPU容器连接的映射表，import缓存
++    """
++
++    # 共享内存区块名称前缀
++    SHM_PREFIX = "vllm_shared"
++
++    # 物理块和逻辑块类型前缀
++    LOGICAL_BLOCK_PREFIX = "logic"
++    PHYSICAL_BLOCK_PREFIX = "phys"
++    EXECUTE_MODEL_REQ_PREFIX = "emr"
++
++    # 保存请求ID到共享内存区名称的映射
++    REQUEST_MAP_NAME = f"{SHM_PREFIX}_request_map"
++
++    def __init__(self, is_gpu_instance: Optional[bool] = None) -> None:
++        """
++        初始化共享内存管理器
++
++        Args:
++            is_gpu_instance: 是否为GPU主实例
++                - True: 作为GPU主实例（服务端），创建映射表
++                - False: 作为CPU主实例（客户端），连接映射表
++                - None: 作为worker/测试/其他，连接映射表
++
++        """
++        self.is_gpu_instance = is_gpu_instance
++        self.request_map_shm = None
++
++        self._init_request_map()
++        if is_gpu_instance is True:
++            log_env = "GPU主实例（创建映射表）"
++        elif is_gpu_instance is False:
++            log_env = "CPU主实例（连接映射表）"
++        else:
++            log_env = "Worker/测试/其他（连接映射表）"
++        logger.info(f"共享内存管理器初始化完成，当前模式: {log_env}")
++
++    # ===== 初始化方法 =====
++    def _init_request_map(self) -> None:
++        """初始化或连接到请求映射表共享内存，使用辅助方法进行创建或重置"""
++        try:
++            self._create_request_map_shm()
++        except FileExistsError:
++            try:
++                self._connect_or_reset_request_map_shm()
++            except OSError as e:
++                logger.warning(f"连接请求映射表失败: {type(e).__name__}({e})，跳过共享内存映射表")
++                self.request_map_shm = None
++        except OSError:
++            logger.exception("创建或连接请求映射表失败")
++            self.request_map_shm = None
++
++    def _create_request_map_shm(self) -> None:
++        """创建新的请求映射表共享内存并保存启动时间"""
++        self.request_map_shm = shared_memory.SharedMemory(
++            name=self.REQUEST_MAP_NAME,
++            create=True,
++            size=10 * 1024 * 1024,
++        )
++        init_time = time.time()
++        initial_map = {"__init_time__": init_time}
++        self._save_to_shm(self.request_map_shm, initial_map)
++        logger.info(f"创建请求映射表: {self.REQUEST_MAP_NAME}，启动时间: {init_time}")
++
++    def _is_request_map_stale(self, data: Dict[str, Any]) -> bool:
++        """判断请求映射表是否超过10分钟"""
++        init_time = data.get("__init_time__")
++        return init_time is None or time.time() - init_time > 2 * 60
++
++    def _connect_or_reset_request_map_shm(self) -> None:
++        """连接到现有请求映射表，若过期则清理并重置"""
++        existing_shm = shared_memory.SharedMemory(
++            name=self.REQUEST_MAP_NAME, create=False)
++        data = self._load_from_shm(existing_shm)
++        if self._is_request_map_stale(data):
++            # 清理旧请求的共享内存
++            for req_id in data.keys():
++                if req_id == "__init_time__":
++                    continue
++                self.cleanup_request(req_id)
++            existing_shm.close()
++            existing_shm.unlink()
++            self._create_request_map_shm()
++        else:
++            self.request_map_shm = existing_shm
++            init_time = data.get("__init_time__")
++            logger.info(
++                f"成功连接到现有请求映射表: {self.REQUEST_MAP_NAME}，启动时间: {init_time}")
++
++    # ===== 通用工具方法 =====
++    def _save_to_shm(self, shm: shared_memory.SharedMemory, data: Any) -> None:
++        """将数据保存到共享内存中"""
++        # 处理numpy数据类型，确保JSON可以序列化
++        def convert_numpy_types(obj):
++            if isinstance(obj, dict):
++                return {k: convert_numpy_types(v) for k, v in obj.items()}
++            elif isinstance(obj, list):
++                return [convert_numpy_types(item) for item in obj]
++            elif isinstance(obj, tuple):
++                return tuple(convert_numpy_types(item) for item in obj)
++            elif hasattr(obj, 'item'):  # numpy数值类型
++                return obj.item()
++            elif isinstance(obj, np.ndarray):
++                return obj.tolist()
++            return obj
++
++        converted_data = convert_numpy_types(data)
++        serialized = json.dumps(converted_data).encode()
++        assert len(
++            serialized) <= shm.size, f"数据大小 ({len(serialized)} 字节) 超过共享内存大小 ({shm.size} 字节)"
++
++        shm.buf[:] = b"\0" * shm.size
++        shm.buf[: len(serialized)] = serialized
++
++    def _load_from_shm(self, shm: shared_memory.SharedMemory) -> Any:
++        """从共享内存加载数据"""
++        i = 0
++        while i < shm.size and shm.buf[i] != 0:
++            i += 1
++        data = shm.buf[:i].tobytes().decode()
++        return json.loads(data)
++
++    def get_logical_block_name(self, request_id: str) -> str:
++        """生成逻辑块的共享内存名称"""
++        return f"{self.SHM_PREFIX}_{request_id}_{self.LOGICAL_BLOCK_PREFIX}"
++
++    def get_physical_block_name(self, request_id: str, block_id: int, tp_rank: int = 0) -> str:
++        """生成物理块的共享内存名称"""
++        return f"{self.SHM_PREFIX}_{request_id}_{self.PHYSICAL_BLOCK_PREFIX}_{block_id}_rank_{tp_rank}"
++
++    # ===== 上传方法 =====
++    def store_logical_block(self, request_id: str, kv_cache_data: Dict[str, Any]) -> bool:
++        """
++        将逻辑块数据存储到共享内存中
++
++        Args:
++            request_id: 请求ID，用作共享内存的唯一标识
++            kv_cache_data: KV缓存数据，包含序列的KV缓存和相关元数据
++
++        Returns:
++            bool: 是否成功存储
++
++        """
++        logger.debug(f"正在存储id: {request_id} 的逻辑块数据")
++
++        physical_mapping = kv_cache_data.get("physical_block_id_mapping", {})
++        kv_cache_data["physical_block_id_mapping"] = physical_mapping
++
++        # 生成逻辑块的共享内存名称并删除可能存在的旧共享内存
++        kv_shm_name = self.get_logical_block_name(request_id)
++        self._remove_existing_shm(kv_shm_name)
++
++        # 序列化KV缓存数据
++        serialized = json.dumps(kv_cache_data).encode()
++        # 预留额外空间存放"physical_blocks_meta"
++        size = len(serialized) + 5 * 1024 * 1024
++
++        shm = None
++        try:
++            shm = shared_memory.SharedMemory(
++                name=kv_shm_name, create=True, size=size)
++            self._save_to_shm(shm, kv_cache_data)
++        except OSError:
++            logger.exception("创建共享内存时出错")
++            return False
++        finally:
++            if shm is not None:
++                shm.close()
++
++        # 更新请求映射表
++        request_map = self._load_from_shm(self.request_map_shm)
++        if request_id not in request_map:
++            request_map[request_id] = {}
++
++        request_map[request_id].update(
++            {
++                "kv_shm_name": kv_shm_name,
++                "timestamp": time.time(),
++                "status": "kv_ready",
++                "kv_cache_size": len(serialized),
++            },
++        )
++        self._save_to_shm(self.request_map_shm, request_map)
++        return True
++
++    def set_physical_blocks_meta(self, request_id: str, meta_list: List[Dict[str, Any]], tp_world_size: int = 1) -> bool:
++        """
++        追加写入物理块元数据到已有 KV 缓存共享内存
++
++        Args:
++            request_id: 请求ID
++            meta_list: 物理块元数据列表
++
++        Returns:
++            bool: 是否成功写入
++
++        """
++        shm = None
++        try:
++            # 从请求映射表获取共享内存名称
++            request_map = self._load_from_shm(self.request_map_shm)
++            if request_id not in request_map or "kv_shm_name" not in request_map[request_id]:
++                logger.warning(f"无法找到请求 {request_id} 的 KV 缓存共享内存名称，跳过写入物理块元数据")
++                return False
++
++            kv_shm_name = request_map[request_id]["kv_shm_name"]
++
++            shm = shared_memory.SharedMemory(name=kv_shm_name, create=False)
++            kv_cache_data = self._load_from_shm(shm)
++            kv_cache_data["physical_blocks_meta"] = meta_list
++            kv_cache_data["tp_world_size"] = tp_world_size
++            self._save_to_shm(shm, kv_cache_data)
++            logger.debug(f"已将物理块元数据写入请求 {request_id} 的 KV 缓存共享内存，共 {len(meta_list)} 个块")
++        except (OSError, json.JSONDecodeError):
++            logger.exception("写入物理块元数据时出错")
++            return False
++        else:
++            return True
++        finally:
++            if shm is not None:
++                shm.close()
++
++    def set_output_token_ids(self, request_id: str, output_token_ids: Dict[int, List[int]]) -> bool:
++        """
++        追加写入物理块元数据到已有 KV 缓存共享内存
++
++        Args:
++            request_id: 请求ID
++            output_token_ids: 输出 token ID 列表
++
++        Returns:
++            bool: 是否成功写入
++
++        """
++        shm = None
++        try:
++            # 从请求映射表获取共享内存名称
++            request_map = self._load_from_shm(self.request_map_shm)
++            if request_id not in request_map or "kv_shm_name" not in request_map[request_id]:
++                logger.warning(f"无法找到请求 {request_id} 的 KV 缓存共享内存名称，跳过写入物理块元数据")
++                return False
++
++            kv_shm_name = request_map[request_id]["kv_shm_name"]
++
++            shm = shared_memory.SharedMemory(name=kv_shm_name, create=False)
++            kv_cache_data = self._load_from_shm(shm)
++            kv_cache_data["output_token_ids"] = output_token_ids
++            self._save_to_shm(shm, kv_cache_data)
++            logger.debug(f"已将输出 token ID 写入请求 {request_id}")
++        except (OSError, json.JSONDecodeError):
++            logger.exception("写入输出 token ID 时出错")
++            return False
++        else:
++            return True
++        finally:
++            if shm is not None:
++                shm.close()
++
++    def upload_physical_blocks_gpu(
++        self,
++        request_id: str,
++        block_id: int,
++        tp_rank: int,
++        worker_data: Dict
++    ) -> bool:
++        """
++        上传GPU物理块到共享内存
++
++        每个worker调用此方法上传自己的rank数据。直接上传到共享内存，不进行合并。
++
++        Args:
++            request_id: 请求ID
++            block_id: 块ID
++            tp_rank: tensor并行的rank
++            worker_data: worker数据字典
++
++        Returns:
++            bool: 是否成功上传
++        """
++        shm = None
++        try:
++            # 通过get_physical_block_name获取唯一的共享内存名称
++            shm_name = self.get_physical_block_name(
++                request_id, block_id, tp_rank)
++            data_array = worker_data["data"]
++
++            # 检查是否已存在
++            try:
++                existing_shm = shared_memory.SharedMemory(
++                    name=shm_name, create=False)
++                existing_shm.close()
++                logger.debug(f"Rank {tp_rank} 块已存在: {shm_name}")
++                return True
++            except FileNotFoundError:
++                pass
++
++            # 创建共享内存并上传数据
++            shm = shared_memory.SharedMemory(
++                name=shm_name,
++                create=True,
++                size=data_array.nbytes
++            )
++            shm_array = np.ndarray(
++                data_array.shape, dtype=data_array.dtype, buffer=shm.buf)
++            shm_array[:] = data_array[:]
++
++            logger.debug(
++                f"Rank {tp_rank} 块已上传: {shm_name}, 大小 {data_array.nbytes / (1024*1024):.2f}MB")
++            return True
++
++        except Exception as e:
++            logger.error(f"上传GPU块失败: {e}")
++            return False
++        finally:
++            if shm is not None:
++                shm.close()
++
++    def upload_physical_blocks_cpu(self, request_id: str, block_id: int, block: np.ndarray) -> Optional[Dict[str, Any]]:
++        """
++        上传物理块到共享内存
++
++        Args:
++            request_id: 请求ID
++            block_id: 物理块ID
++            block: 物理块数据
++
++        Returns:
++            Optional[Dict[str, Any]]: 物理块元数据
++
++        """
++        shm = None
++        try:
++            # 生成物理块的共享内存名称并删除可能存在的旧共享内存
++            shm_name = self.get_physical_block_name(request_id, block_id)
++            self._remove_existing_shm(shm_name)
++
++            logger.debug(
++                f"物理块 {block_id} 的形状: {block.shape}, "
++                f"数据类型: {block.dtype}, "
++                f"大小: {block.nbytes / (1024 * 1024):.2f}MB",
++            )
++            shm = shared_memory.SharedMemory(
++                name=shm_name, create=True, size=block.nbytes)
++            shm_array = np.ndarray(
++                block.shape, dtype=block.dtype, buffer=shm.buf)
++            shm_array[:] = block[:]
++            meta = {
++                "block_id": block_id,
++                "shm_name": shm_name,
++                "shape": shm_array.shape,
++                "dtype": str(shm_array.dtype),
++                "nbytes": shm_array.nbytes,
++            }
++            logger.debug(
++                f"已导出物理块 {block_id} 到共享内存 {shm_name}, 大小: {block.nbytes / (1024 * 1024):.2f}MB")
++        except OSError:
++            logger.exception("导出物理块 %s 到共享内存时出错", block_id)
++            return None
++        else:
++            return meta
++        finally:
++            if shm is not None:
++                shm.close()
++
++    # ===== 下载相关方法 =====
++    def load_logical_block(self, request_id: str) -> Optional[Dict[str, Any]]:
++        """
++        从共享内存加载逻辑块数据
++
++        Args:
++            request_id: 请求ID
++
++        Returns:
++            Optional[Dict[str, Any]]: KV缓存数据，如果不存在则返回None
++
++        """
++        logger.debug(f"尝试从共享内存加载请求 {request_id} 的逻辑块数据")
++
++        # 从请求映射表查找
++        request_map = self._load_from_shm(self.request_map_shm)
++        if request_id not in request_map or "kv_shm_name" not in request_map[request_id]:
++            logger.warning(f"请求 {request_id} 没有逻辑块共享内存")
++            return None
++
++        shm_info: Dict[str, Any] = request_map[request_id]
++        logger.debug(f"请求 {request_id} 的共享内存信息: {shm_info}")
++
++        shm = None
++        try:
++            kv_shm_name = shm_info["kv_shm_name"]
++            shm = shared_memory.SharedMemory(name=kv_shm_name, create=False)
++            logger.debug(f"成功连接到共享内存 {kv_shm_name}, 分配大小: {shm.size / (1024 * 1024):.2f} MB")
++
++            kv_cache_data = self._load_from_shm(shm)
++            logger.debug(f"成功从共享内存加载请求 {request_id} 的逻辑块, 包含的键: {list(kv_cache_data.keys())}")
++        except (OSError, json.JSONDecodeError):
++            logger.exception("加载逻辑块时出错")
++            return None
++        else:
++            return kv_cache_data
++        finally:
++            if shm is not None:
++                shm.close()
++
++    def merge_physical_blocks_meta(self, request_id: str, meta: Dict[str, Any], tp_world_size: int) -> np.ndarray:
++        """
++        合并多个rank的物理块碎片
++
++        Args:
++            request_id: 请求ID
++            meta: 物理块元数据（来自rank_0）
++            tp_world_size: tensor并行的世界大小
++
++        Returns:
++            np.ndarray: 拼接后的完整数据
++        """
++        block_id = meta["block_id"]
++        fragment_shape = meta["shape"]  # rank_0的形状
++        fragment_dtype = np.dtype(meta["dtype"])
++
++        logger.debug(f"开始合并块 {block_id} 的 {tp_world_size} 个碎片")
++
++        # 读取所有rank的碎片
++        fragments = []
++        fragment_shms = []
++
++        try:
++            for tp_rank in range(tp_world_size):
++                fragment_name = self.get_physical_block_name(
++                    request_id, block_id, tp_rank)
++                fragment_shm = shared_memory.SharedMemory(
++                    name=fragment_name, create=False)
++                fragment_shms.append(fragment_shm)
++
++                # 读取碎片数据
++                fragment_data = np.ndarray(
++                    fragment_shape, dtype=fragment_dtype, buffer=fragment_shm.buf)
++                fragments.append(fragment_data.copy())
++
++                logger.debug(
++                    f"读取rank {tp_rank} 碎片: {fragment_name}, shape={fragment_data.shape}")
++
++            # 拼接碎片：在head维度上拼接
++            # fragment_shape: [num_layers, 2, block_size, current_heads, head_size]
++            # 需要在dim=3（head维度）上拼接
++            merged_data = np.concatenate(fragments, axis=3)
++
++            logger.debug(
++                f"成功拼接块 {block_id}: 从 {len(fragments)} 个碎片 -> {merged_data.shape}, 大小 {merged_data.nbytes / (1024*1024):.2f}MB")
++
++            return merged_data
++
++        finally:
++            # 清理碎片共享内存
++            for shm in fragment_shms:
++                try:
++                    shm.close()
++                except:
++                    pass
++
++    # ===== 清除工具方法 =====
++    def _remove_existing_shm(self, shm_name: str) -> None:
++        """删除指定共享内存，先关闭并unlink。"""
++        try:
++            existing_shm = shared_memory.SharedMemory(
++                name=shm_name, create=False)
++            existing_shm.close()
++            existing_shm.unlink()
++        except FileNotFoundError:
++            return
++        except OSError:
++            with contextlib.suppress(FileNotFoundError):
++                Path(f"/dev/shm/{shm_name}").unlink()
++
++    def cleanup_request(self, request_id: str) -> None:
++        """
++        清理指定请求的逻辑块和物理块共享内存，以及从请求映射表中移除记录。
++
++        Args:
++            request_id: 请求ID
++
++        """
++        try:
++            # 获取逻辑块名称
++            logic_name = self.get_logical_block_name(request_id)
++            # 读取逻辑块数据以获取物理块元数据
++            shm = None
++            try:
++                shm = shared_memory.SharedMemory(name=logic_name, create=False)
++                kv_cache_data = self._load_from_shm(shm)
++            except (OSError, json.JSONDecodeError):
++                kv_cache_data = {}
++            finally:
++                if shm is not None:
++                    shm.close()
++
++            # 获取tensor parallel world size
++            tp_world_size = kv_cache_data.get("tp_world_size", 1)
++
++            # 释放所有物理块共享内存（包括碎片）
++            for meta in kv_cache_data.get("physical_blocks_meta") or []:
++                block_id = meta.get("block_id")
++                # 清理所有tensor parallel rank的碎片
++                for tp_rank in range(tp_world_size):
++                    fragment_name = self.get_physical_block_name(
++                        request_id, block_id, tp_rank)
++                    self._remove_existing_shm(fragment_name)
++
++            # 释放逻辑块
++            self._remove_existing_shm(logic_name)
++            # 从请求映射表中移除条目
++            if self.request_map_shm is not None:
++                request_map = self._load_from_shm(self.request_map_shm)
++                if request_id in request_map:
++                    del request_map[request_id]
++                    self._save_to_shm(self.request_map_shm, request_map)
++            logger.debug(f"已清理请求 {request_id} 的所有共享内存资源")
++        except (OSError, json.JSONDecodeError):
++            logger.exception("清理请求 %s 时出错", request_id)
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 1c8f25d..b04b3c4 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -223,6 +223,10 @@ class EngineArgs:
+     reasoning_parser: Optional[str] = None
+     use_tqdm_on_load: bool = True
+ 
++    # Additional parameters for custom features
++    use_greedy: bool = True
++    enable_auto_pd_offload: bool = False
++
+     def __post_init__(self):
+         if not self.tokenizer:
+             self.tokenizer = self.model
+@@ -1116,6 +1120,25 @@ class EngineArgs:
+             "Note that even if this is set to False, cascade attention will be "
+             "only used when the heuristic tells that it's beneficial.")
+ 
++        parser.add_argument(
++            '--use-greedy',
++            action='store_true',
++            default=True,
++            help='Whether to enable greedy mode in CPU mode (sets temperature to 0.0 by default). Accepts true or false'
++        )
++
++        parser.add_argument(
++            '--enable-auto-pd-offload',
++            action='store_true',
++            default=False,
++            help='Enable shared memory initialization for dual-instance (GPU & CPU) '
++                 'PD separation. When enabled, the GPU instance will automatically '
++                 'upload KV cache to shared memory instead of swapping to CPU memory '
++                 'when swapout is triggered, allowing the CPU instance to take over '
++                 'and continue decoding.'
++        )
++
++
+         return parser
+ 
+     @classmethod
+@@ -1488,6 +1511,7 @@ class EngineArgs:
+             compilation_config=self.compilation_config,
+             kv_transfer_config=self.kv_transfer_config,
+             additional_config=self.additional_config,
++            enable_auto_pd_offload=self.enable_auto_pd_offload,
+         )
+ 
+         return config
+diff --git a/vllm/engine/async_llm_engine.py b/vllm/engine/async_llm_engine.py
+index 079e2a0..a212e6c 100644
+--- a/vllm/engine/async_llm_engine.py
++++ b/vllm/engine/async_llm_engine.py
+@@ -407,7 +407,7 @@ class _AsyncLLMEngine(LLMEngine):
+             # Multi-step case
+             return ctx.request_outputs
+ 
+-        if not self.has_unfinished_requests():
++        if not self.has_unfinished_seqs_for_sysHAX():
+             # Drain async postprocessor (if exists)
+             if len(ctx.output_queue) > 0:
+                 self._process_model_outputs(ctx=ctx)
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index bce7736..e748d4a 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -62,6 +62,9 @@ from vllm.utils import (Counter, Device, deprecate_kwargs,
+ from vllm.version import __version__ as VLLM_VERSION
+ from vllm.worker.model_runner_base import InputProcessingError
+ 
++# 导入共享内存管理器
++from vllm.core.shared_memory import SharedMemoryManager
++
+ logger = init_logger(__name__)
+ _LOCAL_LOGGING_INTERVAL_SEC = 5
+ 
+@@ -246,6 +249,16 @@ class LLMEngine:
+             use_cached_outputs,
+         )
+ 
++        # 初始化共享内存管理器（仅在启用自动PD卸载时）
++        if vllm_config.enable_auto_pd_offload:
++            is_gpu_instance = (self.device_config.device.type == "cuda")
++            self.shared_memory_manager = SharedMemoryManager(
++                is_gpu_instance=is_gpu_instance)
++            logger.info("已初始化共享内存管理器，用于KV缓存共享")
++        else:
++            self.shared_memory_manager = None
++            logger.info("未启用自动PD卸载，跳过共享内存管理器初始化")
++
+         self.log_stats = log_stats
+         self.use_cached_outputs = use_cached_outputs
+ 
+@@ -277,7 +290,10 @@ class LLMEngine:
+         self.input_processor = input_registry.create_input_processor(
+             self.model_config)
+ 
+-        self.model_executor = executor_class(vllm_config=vllm_config, )
++        self.model_executor = executor_class(
++            vllm_config=vllm_config,
++            shared_memory_manager=self.shared_memory_manager,
++        )
+ 
+         if self.model_config.runner_type != "pooling":
+             self._initialize_kv_caches()
+@@ -363,7 +379,8 @@ class LLMEngine:
+                 self.scheduler_config, self.cache_config, self.lora_config,
+                 self.parallel_config.pipeline_parallel_size,
+                 self.async_callbacks[v_id]
+-                if self.model_config.use_async_output_proc else None)
++                if self.model_config.use_async_output_proc else None,
++                shared_memory_manager=self.shared_memory_manager)
+             for v_id in range(self.parallel_config.pipeline_parallel_size)
+         ]
+ 
+@@ -409,10 +426,9 @@ class LLMEngine:
+                 self.scheduler,
+                 self.seq_counter,
+                 get_tokenizer_for_seq,
+-                stop_checker=StopChecker(
+-                    self.scheduler_config.max_model_len,
+-                    get_tokenizer_for_seq,
+-                ),
++                stop_checker=StopChecker(self.scheduler_config.max_model_len,
++                                         get_tokenizer_for_seq,
++                                         enable_auto_pd_offload=vllm_config.enable_auto_pd_offload),
+             ))
+ 
+         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
+@@ -517,12 +533,17 @@ class LLMEngine:
+             from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
+             engine_cls = V1LLMEngine
+ 
+-        return engine_cls.from_vllm_config(
++        engine = engine_cls.from_vllm_config(
+             vllm_config=vllm_config,
+             usage_context=usage_context,
+             stat_loggers=stat_loggers,
+             disable_log_stats=engine_args.disable_log_stats,
+         )
++        # Store use_greedy flag to allow CPU-mode default greedy setting.
++        engine.use_greedy = engine_args.use_greedy
++        # Store enable_auto_pd_offload flag to control auto PD offload functionality.
++        engine.enable_auto_pd_offload = engine_args.enable_auto_pd_offload
++        return engine
+ 
+     def __reduce__(self):
+         # This is to ensure that the LLMEngine is not referenced in
+@@ -788,6 +809,11 @@ class LLMEngine:
+         )
+         processed_inputs = self.input_processor(preprocessed_inputs)
+ 
++        # Override temperature to 0.0 in CPU mode when use_greedy is enabled.
++        if isinstance(params, SamplingParams) and self.device_config.device.type == "cpu" and getattr(self, 'use_greedy', True):
++            logger.info("CPU 模式：启用 Greedy 模式，已将 temperature 设置为 0.0，可以使用 --use-greedy=false 来取消。")
++            params.temperature = 0.0
++
+         self._add_processed_request(
+             request_id=request_id,
+             processed_inputs=processed_inputs,
+@@ -947,6 +973,13 @@ class LLMEngine:
+         return any(scheduler.has_unfinished_seqs()
+                    for scheduler in self.scheduler)
+ 
++    def has_unfinished_seqs_for_sysHAX(self) -> bool:
++        """
++        Returns True if there are unfinished requests for the sysHAX.
++        """
++        return any(scheduler.has_unfinished_seqs_for_sysHAX()
++                   for scheduler in self.scheduler)
++
+     def has_unfinished_requests_for_virtual_engine(
+             self, virtual_engine: int) -> bool:
+         """
+@@ -1112,13 +1145,16 @@ class LLMEngine:
+                 output = [outputs_by_sequence_group[0][i]]
+ 
+             if not is_async:
+-                if self.scheduler_config.is_multi_step:
+-                    # Updates happen only if the sequence is prefill
+-                    self._update_num_computed_tokens_for_multi_step_prefill(
+-                        seq_group, seq_group_meta, is_first_step_output)
+-                else:
+-                    seq_group.update_num_computed_tokens(
+-                        seq_group_meta.token_chunk_size or 0)
++                # Skip computed tokens update for decode-relay tasks
++                params = seq_group.sampling_params
++                if params is not None and params.request_id_inference is None:
++                    if self.scheduler_config.is_multi_step:
++                        # Updates happen only if the sequence is prefill
++                        self._update_num_computed_tokens_for_multi_step_prefill(
++                            seq_group, seq_group_meta, is_first_step_output)
++                    else:
++                        seq_group.update_num_computed_tokens(
++                            seq_group_meta.token_chunk_size or 0)
+ 
+             if outputs:
+                 for o in outputs:
+@@ -1142,9 +1178,58 @@ class LLMEngine:
+             else:
+                 self.output_processor.process_prompt_logprob(seq_group, output)
+                 if seq_group_meta.do_sample:
++                    # 初始化kv cache相关变量
++                    need_store_kv_cache = False
++                    kv_cache_mapping = None
++
++                    # 在StopChecker之前处理kv cache上传
++                    if (self.shared_memory_manager is not None
++                        and seq_group.sampling_params is not None
++                        and seq_group.sampling_params.num_decode_tokens is not None
++                            and not seq_group.is_prefill()):
++
++                        # 递减num_decode_tokens
++                        if seq_group.sampling_params.num_decode_tokens > 0:
++                            seq_group.sampling_params.num_decode_tokens -= 1
++
++                        # 检查是否到达最后一个token，如果是，先准备kv cache数据
++                        need_store_kv_cache = seq_group.sampling_params.num_decode_tokens == 0
++
++                        if need_store_kv_cache:
++                            # 在process_outputs之前，先获取所有需要的信息
++                            kv_cache_mapping = {}
++                            for seq in seq_group.get_seqs():
++                                block_table = self.scheduler[0].block_manager.block_tables[seq.seq_id]
++                                block_ids = block_table.physical_block_ids.copy()
++                                kv_cache_mapping[seq.seq_id] = block_ids
++
++                    # 处理输出，添加token
+                     self.output_processor.process_outputs(
+                         seq_group, output, is_async)
+ 
++                    # 在process_outputs之后，如果需要存储kv cache，则进行处理
++                    if need_store_kv_cache and kv_cache_mapping is not None:
++                        # 保存到共享内存
++                        seq_group.physical_block_mapping = self.scheduler[0].store_kv_cache(
++                            seq_group, kv_cache_mapping)
++
++                        # 上传到共享内存
++                        if seq_group.physical_block_mapping:
++                            success_copy = self.model_executor.copy_block_to_sharememory(
++                                virtual_engine=0,
++                                request_id=seq_group.request_id,
++                                physical_block_mapping=seq_group.physical_block_mapping
++                            )
++                            # 现在存储包含最后一个token的完整output_token_ids
++                            output_ids: Dict[int, List[int]] = {
++                                seq.seq_id: list(
++                                    seq.data.get_output_token_ids())
++                                for seq in seq_group.get_seqs()
++                            }
++                            self.shared_memory_manager.set_output_token_ids(
++                                seq_group.request_id, output_ids
++                            )
++
+             if seq_group.is_finished():
+                 finished_now.append(i)
+ 
+@@ -1163,6 +1248,13 @@ class LLMEngine:
+             if request_output:
+                 ctx.request_outputs.append(request_output)
+ 
++            # 清理完成请求的共享内存（如果有request_id_inference参数）
++            if (seq_group.sampling_params is not None
++                and self.shared_memory_manager is not None
++                    and seq_group.sampling_params.request_id_inference is not None):
++                self.shared_memory_manager.cleanup_request(
++                    seq_group.sampling_params.request_id_inference)
++
+         # When we process a single request, we skip it for the next time,
+         # and invoke the request output callback (if there was final output)
+         if request_id:
+@@ -1180,6 +1272,50 @@ class LLMEngine:
+             for scheduler in self.scheduler:
+                 scheduler.free_finished_seq_groups()
+ 
++        # AUTO_PD_OFFLOAD: 处理swapped队列中的SCHEDULED序列，为它们生成RequestOutput
++        if self.shared_memory_manager is not None:
++            for scheduler in self.scheduler:
++                scheduled_seq_groups = []
++
++                for seq_group in list(scheduler.swapped):
++                    if seq_group.is_scheduled():
++                        # 检查是否已经处理过，避免重复生成RequestOutput
++                        if hasattr(seq_group, '_auto_pd_offload_processed'):
++                            continue
++
++                        # 为SCHEDULED状态的序列生成RequestOutput
++                        seq_group.maybe_set_first_token_time(now)
++                        if not seq_group.is_prefill():
++                            seq_group.set_last_token_time(now)
++                        request_output = RequestOutputFactory.create(
++                            seq_group,
++                            self.seq_id_to_seq_group,
++                            use_cache=self.use_cached_outputs)
++                        if request_output:
++                            ctx.request_outputs.append(request_output)
++                            scheduled_seq_groups.append(seq_group)
++                            logger.debug(
++                                f"为AUTO_PD_OFFLOAD序列组 {seq_group.request_id} 生成了RequestOutput")
++
++                            # 标记为已处理，避免重复处理
++                            seq_group._auto_pd_offload_processed = True
++
++                        # 清理完成请求的共享内存
++                        if (seq_group.sampling_params is not None
++                                and seq_group.sampling_params.request_id_inference is not None):
++                            self.shared_memory_manager.cleanup_request(
++                                seq_group.sampling_params.request_id_inference)
++
++                # 立即从swapped队列中移除已处理的序列，避免重复处理
++                for seq_group in scheduled_seq_groups:
++                    if seq_group in scheduler.swapped:
++                        scheduler.swapped.remove(seq_group)
++
++                # 记录处理的序列组数量
++                if scheduled_seq_groups:
++                    logger.debug(
++                        f"AUTO_PD_OFFLOAD: 为 {len(scheduled_seq_groups)} 个swapped队列中的SCHEDULED序列生成了RequestOutput")
++
+         # For multi-step without streaming, don't create outputs each iteration
+         if not is_last_step and not ctx.multi_step_stream_outputs:
+             # Immediately process request outputs here (if callback is given)
+@@ -1414,6 +1550,17 @@ class LLMEngine:
+             last_sampled_token_ids = \
+                 self._get_last_sampled_token_ids(virtual_engine)
+ 
++            # 处理AUTO_PD_OFFLOAD逻辑
++            if (self.vllm_config.enable_auto_pd_offload and
++                self.shared_memory_manager is not None and
++                    scheduler_outputs.blocks_to_swap_out):
++
++                # 处理需要swap out的请求进行kv cache导出
++                self._handle_auto_pd_offload_swap_out(virtual_engine)
++
++                # 清空blocks_to_swap_out，因为我们已经处理了这些请求
++                scheduler_outputs.blocks_to_swap_out = []
++
+             execute_model_req = ExecuteModelRequest(
+                 seq_group_metadata_list=seq_group_metadata_list,
+                 blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
+@@ -1426,6 +1573,22 @@ class LLMEngine:
+                 # to each of the non-last PP stages for in-place prepare_input.
+                 last_sampled_token_ids=last_sampled_token_ids)
+ 
++            if self.shared_memory_manager is not None:
++                # 接力 decode 阶段加载接力数据，GPU、CPU 通用
++                for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
++                    seq_group = scheduled_seq_group.seq_group
++                    params = seq_group.sampling_params
++                    if seq_group.is_load_prefill_kvcache:
++                        continue
++                    if params is not None and params.num_decode_tokens is not None:
++                        if params.request_id_inference is not None:
++                            success_copy = self.model_executor.copy_block_from_sharememory(
++                                virtual_engine=virtual_engine,
++                                request_id=params.request_id_inference,
++                                physical_block_mapping=seq_group.physical_block_mapping
++                            )
++                            seq_group.is_load_prefill_kvcache = True
++
+             if allow_async_output_proc:
+                 execute_model_req.async_callback = self.async_callbacks[
+                     virtual_engine]
+@@ -1505,7 +1668,7 @@ class LLMEngine:
+             # Multi-step case
+             return ctx.request_outputs
+ 
+-        if not self.has_unfinished_requests():
++        if not self.has_unfinished_seqs_for_sysHAX():
+             # Drain async postprocessor (if exists)
+             if len(ctx.output_queue) > 0:
+                 self._process_model_outputs(ctx=ctx)
+@@ -1725,6 +1888,11 @@ class LLMEngine:
+             logger.debug("Stopping remote worker execution loop.")
+             self.model_executor.stop_remote_worker_execution_loop()
+ 
++        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
++            seq_group = scheduled_seq_group.seq_group
++            for seq in seq_group.get_seqs():
++                seq.scheduled_finished = True
++
+         return ctx.request_outputs, outputs[0].hidden_states
+ 
+     def _abort_and_cache_schedule(
+@@ -2331,7 +2499,138 @@ class LLMEngine:
+                 sampling_params.logits_processors.extend(logits_processors)
+ 
+         return sampling_params
++        
++    def _handle_auto_pd_offload_swap_out(self, virtual_engine: int) -> None:
++        """
++        处理AUTO_PD_OFFLOAD模式下的swap out请求。
++
++        将需要swap out的序列组的KV cache导出到共享内存，
++        然后通过StopChecker将这些序列标记为SCHEDULED状态。
++
++        Args:
++            virtual_engine: 虚拟引擎ID
++        """
++        if not self.shared_memory_manager:
++            logger.warning("AUTO_PD_OFFLOAD被触发但shared_memory_manager为None")
++            return
++
++        # 检查swapped队列是否有需要处理的序列组
++        if not self.scheduler[virtual_engine].swapped:
++            return
++
++        logger.debug(
++            f"发现 {len(self.scheduler[virtual_engine].swapped)} 个被swap out的序列组，准备进行AUTO_PD_OFFLOAD处理")
++
++        # 收集需要标记为SCHEDULED的序列组
++        seq_groups_to_schedule = []
++
++        # 为每个被swap out的序列组处理KV cache导出
++        for seq_group in self.scheduler[virtual_engine].swapped:
++            try:
++                # 跳过已经处理过的序列组（num_decode_tokens已设置为0）
++                if (seq_group.sampling_params is not None and
++                        seq_group.sampling_params.num_decode_tokens == 0):
++                    continue
++
++                # 使用预存储的物理块映射（在swap out之前获取）
++                kv_cache_mapping = getattr(
++                    seq_group, 'auto_pd_offload_mapping', None)
++
++                if not kv_cache_mapping:
++                    logger.warning(
++                        f"序列组 {seq_group.request_id} 没有预存储的物理块映射，跳过处理")
++                    continue
++
++                # 保存到共享内存
++                swapped_seqs = seq_group.get_seqs(
++                    status=SequenceStatus.SWAPPED)
++                kv_cache_data = {
++                    "physical_block_id_mapping": kv_cache_mapping,
++                    "device": 'gpu',
++                    "physical_blocks_meta": None,
++                    "output_token_ids": {seq.seq_id: seq.data.output_token_ids for seq in swapped_seqs},
++                }
++
++                # 存储逻辑块数据到共享内存
++                if self.shared_memory_manager.store_logical_block(seq_group.request_id, kv_cache_data):
++                    logger.debug(
++                        f"成功将序列组 {seq_group.request_id} 的KV缓存逻辑数据上传到共享内存")
++
++                    # 上传物理块数据到共享内存
++                    success = self.model_executor.copy_block_to_sharememory(
++                        virtual_engine=virtual_engine,
++                        request_id=seq_group.request_id,
++                        physical_block_mapping=kv_cache_mapping
++                    )
++
++                    if success:
++                        logger.debug(f"成功上传序列组 {seq_group.request_id} 的物理块数据到共享内存")
++
++                        # 设置sampling_params的num_decode_tokens为0，这样会在StopChecker中被检测到并结束
++                        if seq_group.sampling_params is not None:
++                            seq_group.sampling_params.num_decode_tokens = 0
++                            logger.debug(f"设置序列组 {seq_group.request_id} 的num_decode_tokens为0，准备通过StopChecker标记为SCHEDULED")
++
++                        # 添加到待处理列表
++                        seq_groups_to_schedule.append(seq_group)
++
++                    else:
++                        logger.error(f"上传序列组 {seq_group.request_id} 的物理块数据到共享内存失败")
++                else:
++                    logger.error(f"存储序列组 {seq_group.request_id} 的KV缓存逻辑数据到共享内存失败")
++
++            except Exception as e:
++                logger.error(f"处理序列组 {seq_group.request_id} 的AUTO_PD_OFFLOAD时发生错误: {e}")
++
++        # 如果有需要处理的序列组，触发StopChecker让它们走正常流程
++        if seq_groups_to_schedule:
++            self._trigger_stop_checker_for_auto_pd_offload(
++                seq_groups_to_schedule)
++
++    def _trigger_stop_checker_for_auto_pd_offload(self, seq_groups: List[SequenceGroup]) -> None:
++        """
++        为AUTO_PD_OFFLOAD的序列组触发正常的stop_checker流程。
++
++        直接调用StopChecker基于num_decode_tokens=0来标记序列为SCHEDULED状态。
++
++        Args:
++            seq_groups: 需要处理的序列组列表
++        """
++        try:
++            # 为每个序列组直接调用StopChecker检查
++            for seq_group in seq_groups:
++                # 获取swapped状态的序列
++                swapped_seqs = seq_group.get_seqs(
++                    status=SequenceStatus.SWAPPED)
++
++                for seq in swapped_seqs:
++                    # 临时将序列状态改为RUNNING，这样才能被正常处理
++                    seq.status = SequenceStatus.RUNNING
++
++                    # 直接调用StopChecker检查停止条件
++                    # 由于num_decode_tokens=0，这应该会将序列状态设置为SCHEDULED
++                    self.output_processor.stop_checker.maybe_stop_sequence(
++                        seq,
++                        new_char_count=0,  # 没有新字符
++                        sampling_params=seq_group.sampling_params,
++                        lora_req=seq_group.lora_request,
++                    )
++
++                    # 检查序列是否被标记为完成
++                    if seq.status == SequenceStatus.SCHEDULED:
++                        logger.debug(f"序列 {seq.seq_id} 通过StopChecker被标记为SCHEDULED")
++                    else:
++                        logger.warning(f"序列 {seq.seq_id} 状态为 {seq.status}，未被正确处理")
++
++                # 清理预存储的mapping数据
++                if hasattr(seq_group, 'auto_pd_offload_mapping'):
++                    delattr(seq_group, 'auto_pd_offload_mapping')
++                    logger.debug(f"已清理序列组 {seq_group.request_id} 的mapping数据")
++
++                logger.debug(f"已为序列组 {seq_group.request_id} 完成StopChecker处理流程")
+ 
++        except Exception as e:
++            logger.error(f"为AUTO_PD_OFFLOAD序列组处理StopChecker时发生错误: {e}")
+ 
+ if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
+     from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
+diff --git a/vllm/engine/multiprocessing/engine.py b/vllm/engine/multiprocessing/engine.py
+index 739cbed..f5b493d 100644
+--- a/vllm/engine/multiprocessing/engine.py
++++ b/vllm/engine/multiprocessing/engine.py
+@@ -205,7 +205,7 @@ class MQLLMEngine:
+         """Core busy loop of the LLMEngine."""
+ 
+         while True:
+-            if not self.engine.has_unfinished_requests():
++            if not self.engine.has_unfinished_seqs_for_sysHAX():
+                 # Poll until there is work to do.
+                 while self.input_socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
+                     # When there's no work, check on engine health and send
+diff --git a/vllm/engine/output_processor/stop_checker.py b/vllm/engine/output_processor/stop_checker.py
+index 6cad9ec..052eb81 100644
+--- a/vllm/engine/output_processor/stop_checker.py
++++ b/vllm/engine/output_processor/stop_checker.py
+@@ -16,10 +16,12 @@ class StopChecker:
+     """
+ 
+     def __init__(self, max_model_len: int,
+-                 get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer]):
++                 get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer],
++                 enable_auto_pd_offload: bool = False):
+         # Do not use it directly, but use `self._get_max_model_len`.
+         self._max_model_len = max_model_len
+         self.get_tokenizer_for_seq = get_tokenizer_for_seq
++        self.enable_auto_pd_offload = enable_auto_pd_offload
+ 
+     def _get_max_model_len(self, lora_req: Optional[LoRARequest]):
+         if lora_req and lora_req.long_lora_max_len:
+@@ -90,6 +92,13 @@ class StopChecker:
+             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+             return
+ 
++        # 动态调度任务（仅在启用自动PD卸载时）
++        if self.enable_auto_pd_offload and sampling_params.num_decode_tokens is not None:
++            # 当num_decode_tokens为0时终止任务
++            if sampling_params.num_decode_tokens == 0:
++                seq.status = SequenceStatus.SCHEDULED
++                return
++
+     @staticmethod
+     def check_stop_strings(
+         output_text: str,
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index a96ca1f..58cc6d0 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -258,6 +258,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     prompt_logprobs: Optional[int] = None
+     # doc: end-chat-completion-sampling-params
+ 
++    request_id_inference: Optional[str] = None
++    num_decode_tokens: Optional[int] = None
++
+     # doc: begin-chat-completion-extra-params
+     echo: bool = Field(
+         default=False,
+@@ -504,7 +507,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             output_kind=RequestOutputKind.DELTA if self.stream \
+                 else RequestOutputKind.FINAL_ONLY,
+             guided_decoding=guided_decoding,
+-            logit_bias=self.logit_bias)
++            logit_bias=self.logit_bias,
++            request_id_inference=self.request_id_inference,
++            num_decode_tokens=self.num_decode_tokens,
++        )
+ 
+     def _get_guided_json_from_tool(
+             self) -> Optional[Union[str, dict, BaseModel]]:
+@@ -683,7 +689,8 @@ class CompletionRequest(OpenAIBaseModel):
+     allowed_token_ids: Optional[list[int]] = None
+     prompt_logprobs: Optional[int] = None
+     # doc: end-completion-sampling-params
+-
++    request_id_inference: Optional[str] = None
++    num_decode_tokens: Optional[int] = None
+     # doc: begin-completion-extra-params
+     add_special_tokens: bool = Field(
+         default=True,
+@@ -874,7 +881,10 @@ class CompletionRequest(OpenAIBaseModel):
+                 else RequestOutputKind.FINAL_ONLY,
+             guided_decoding=guided_decoding,
+             logit_bias=self.logit_bias,
+-            allowed_token_ids=self.allowed_token_ids)
++            allowed_token_ids=self.allowed_token_ids,
++            request_id_inference=self.request_id_inference,
++            num_decode_tokens=self.num_decode_tokens,    
++        )
+ 
+     @model_validator(mode="before")
+     @classmethod
+diff --git a/vllm/executor/executor_base.py b/vllm/executor/executor_base.py
+index be0fe86..d306bc3 100644
+--- a/vllm/executor/executor_base.py
++++ b/vllm/executor/executor_base.py
+@@ -37,6 +37,7 @@ class ExecutorBase(ABC):
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
++        shared_memory_manager=None,
+     ) -> None:
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+@@ -49,6 +50,7 @@ class ExecutorBase(ABC):
+         self.speculative_config = vllm_config.speculative_config
+         self.prompt_adapter_config = vllm_config.prompt_adapter_config
+         self.observability_config = vllm_config.observability_config
++        self.shared_memory_manager = shared_memory_manager
+         self._init_executor()
+         self.is_sleeping = False
+ 
+@@ -237,6 +239,28 @@ class ExecutorBase(ABC):
+                                         pattern=pattern,
+                                         max_size=max_size))
+ 
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        raise NotImplementedError
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        raise NotImplementedError
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req: Optional[ExecuteModelRequest] = None
++    ) -> None:
++        raise NotImplementedError
++
+     @abstractmethod
+     def check_health(self) -> None:
+         """Checks if the executor is healthy. If not, it should raise an
+diff --git a/vllm/executor/mp_distributed_executor.py b/vllm/executor/mp_distributed_executor.py
+index 1ac48fe..67ef8a6 100644
+--- a/vllm/executor/mp_distributed_executor.py
++++ b/vllm/executor/mp_distributed_executor.py
+@@ -103,7 +103,8 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
+         # Set up signal handlers to shutdown the executor cleanly
+         # sometimes gc does not work well
+ 
+-        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
++        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0,
++                                               shared_memory_manager=self.shared_memory_manager)
+ 
+         all_kwargs = []
+         distributed_init_method = get_distributed_init_method(
+@@ -118,6 +119,7 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
+                 distributed_init_method=distributed_init_method,
+                 is_driver_worker=(not self.parallel_config)
+                 or (rank % self.parallel_config.tensor_parallel_size == 0),
++                shared_memory_manager=self.shared_memory_manager,
+             )
+             all_kwargs.append(kwargs)
+         self._run_workers("init_worker", all_kwargs)
+@@ -251,3 +253,67 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
+             for worker in self.non_driver_workers
+         ]
+         return await asyncio.gather(*coros)
++
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        # 通过ExecuteModelRequest传递共享内存操作
++        blocks_to_shared_memory_upload = {
++            request_id: physical_block_mapping
++        }
++        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
++        execute_model_req = ExecuteModelRequest(
++            seq_group_metadata_list=[],  # 空列表而不是None
++            blocks_to_swap_in=[],
++            blocks_to_swap_out=[],
++            blocks_to_copy=[],
++            blocks_to_shared_memory_upload=blocks_to_shared_memory_upload,
++            blocks_to_shared_memory_download=None,
++            virtual_engine=virtual_engine,
++            num_steps=1,
++            finished_requests_ids=[],
++            num_lookahead_slots=0,
++        )
++        # 通过driver执行共享内存操作
++        self._driver_execute_model(execute_model_req)
++        return True
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        # 通过ExecuteModelRequest传递共享内存操作，而不是直接使用collective_rpc
++        blocks_to_shared_memory_download = {
++            request_id: physical_block_mapping
++        }
++
++        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
++        execute_model_req = ExecuteModelRequest(
++            seq_group_metadata_list=[],  # 空列表而不是None
++            blocks_to_swap_in=[],
++            blocks_to_swap_out=[],
++            blocks_to_copy=[],
++            blocks_to_shared_memory_upload=None,
++            blocks_to_shared_memory_download=blocks_to_shared_memory_download,
++            virtual_engine=virtual_engine,
++            num_steps=1,
++            finished_requests_ids=[],
++            num_lookahead_slots=0,
++        )
++        # 通过driver执行共享内存操作
++        self._driver_execute_model(execute_model_req)
++        return True
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req=None
++    ) -> None:
++        self.collective_rpc(
++            "swap_block_gpu_cpu",
++            args=(execute_model_req,),
++        )
+diff --git a/vllm/executor/ray_distributed_executor.py b/vllm/executor/ray_distributed_executor.py
+index 36ee3f3..510fe59 100644
+--- a/vllm/executor/ray_distributed_executor.py
++++ b/vllm/executor/ray_distributed_executor.py
+@@ -213,7 +213,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
+                     scheduling_strategy=scheduling_strategy,
+                     **ray_remote_kwargs,
+                 )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,
+-                                           rpc_rank=rank)
++                                           rpc_rank=rank,
++                                           shared_memory_manager=self.shared_memory_manager)
+             else:
+                 worker = ray.remote(
+                     num_cpus=0,
+@@ -222,7 +223,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
+                     scheduling_strategy=scheduling_strategy,
+                     **ray_remote_kwargs,
+                 )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,
+-                                           rpc_rank=rank)
++                                           rpc_rank=rank,
++                                           shared_memory_manager=self.shared_memory_manager)
+             worker_metadata.append(
+                 RayWorkerMetaData(worker=worker, created_rank=rank))
+ 
+@@ -244,7 +246,9 @@ class RayDistributedExecutor(DistributedExecutorBase):
+                     # as the resource holder for the driver process.
+                     self.driver_dummy_worker = worker
+                     self.driver_worker = RayWorkerWrapper(
+-                        vllm_config=self.vllm_config, rpc_rank=0)
++                        vllm_config=self.vllm_config,
++                        rpc_rank=0,
++                        shared_memory_manager=self.shared_memory_manager)
+                     worker_metadata.pop(i)
+                     break
+ 
+@@ -706,3 +710,68 @@ class RayDistributedExecutor(DistributedExecutorBase):
+         # Assume that the Ray workers are healthy.
+         # TODO: check the health of the Ray workers
+         return
++
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        # 通过ExecuteModelRequest传递共享内存操作
++        blocks_to_shared_memory_upload = {
++            request_id: physical_block_mapping
++        }
++
++        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
++        execute_model_req = ExecuteModelRequest(
++            seq_group_metadata_list=[],  # 空列表而不是None
++            blocks_to_swap_in=[],
++            blocks_to_swap_out=[],
++            blocks_to_copy=[],
++            blocks_to_shared_memory_upload=blocks_to_shared_memory_upload,
++            blocks_to_shared_memory_download=None,
++            virtual_engine=virtual_engine,
++            num_steps=1,
++            finished_requests_ids=[],
++            num_lookahead_slots=0,
++        )
++        # 通过driver执行共享内存操作
++        self._driver_execute_model(execute_model_req)
++        return True
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        # 通过ExecuteModelRequest传递共享内存操作，而不是直接使用collective_rpc
++        blocks_to_shared_memory_download = {
++            request_id: physical_block_mapping
++        }
++
++        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
++        execute_model_req = ExecuteModelRequest(
++            seq_group_metadata_list=[],  # 空列表而不是None
++            blocks_to_swap_in=[],
++            blocks_to_swap_out=[],
++            blocks_to_copy=[],
++            blocks_to_shared_memory_upload=None,
++            blocks_to_shared_memory_download=blocks_to_shared_memory_download,
++            virtual_engine=virtual_engine,
++            num_steps=1,
++            finished_requests_ids=[],
++            num_lookahead_slots=0,
++        )
++        # 通过driver执行共享内存操作
++        self._driver_execute_model(execute_model_req)
++        return True
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req=None
++    ) -> None:
++        self.collective_rpc(
++            "swap_block_gpu_cpu",
++            args=(execute_model_req,),
++        )
+diff --git a/vllm/executor/ray_utils.py b/vllm/executor/ray_utils.py
+index 37cc07b..78d357f 100644
+--- a/vllm/executor/ray_utils.py
++++ b/vllm/executor/ray_utils.py
+@@ -38,8 +38,9 @@ try:
+         """Ray wrapper for vllm.worker.Worker, allowing Worker to be
+         lazily initialized after Ray sets CUDA_VISIBLE_DEVICES."""
+ 
+-        def __init__(self, *args, **kwargs) -> None:
++        def __init__(self, shared_memory_manager=None, *args, **kwargs) -> None:
+             super().__init__(*args, **kwargs)
++            self.shared_memory_manager = shared_memory_manager
+             # Since the compiled DAG runs a main execution
+             # in a different thread that calls cuda.set_device.
+             # The flag indicates is set_device is called on
+@@ -139,6 +140,12 @@ try:
+                 output = scheduler_output, output
+             return output
+ 
++        def init_worker(self, *args, **kwargs):
++            """Override init_worker to pass shared_memory_manager."""
++            if "shared_memory_manager" not in kwargs:
++                kwargs["shared_memory_manager"] = self.shared_memory_manager
++            return super().init_worker(*args, **kwargs)
++
+         def override_env_vars(self, vars: Dict[str, str]):
+             os.environ.update(vars)
+ 
+diff --git a/vllm/executor/uniproc_executor.py b/vllm/executor/uniproc_executor.py
+index 8c004c7..84943ff 100644
+--- a/vllm/executor/uniproc_executor.py
++++ b/vllm/executor/uniproc_executor.py
+@@ -24,7 +24,8 @@ class UniProcExecutor(ExecutorBase):
+         """Initialize the worker and load the model.
+         """
+         self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config,
+-                                               rpc_rank=0)
++                                               rpc_rank=0,
++                                               shared_memory_manager=self.shared_memory_manager)
+         distributed_init_method = get_distributed_init_method(
+             get_ip(), get_open_port())
+         local_rank = 0
+@@ -61,6 +62,28 @@ class UniProcExecutor(ExecutorBase):
+         # it's running.
+         return
+ 
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        return self.driver_worker.copy_block_to_sharememory(virtual_engine, request_id, physical_block_mapping)
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        return self.driver_worker.copy_block_from_sharememory(virtual_engine, request_id, physical_block_mapping)
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req=None
++    ) -> None:
++        return self.driver_worker.swap_block_gpu_cpu(execute_model_req=execute_model_req)
++
+ 
+ UniProcExecutorAsync = UniProcExecutor
+ 
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1ee1332..a773a15 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -156,7 +156,6 @@ class SamplerOutput(
+             f"sampled_token_ids={sampled_token_ids_repr}, "
+             f"spec_decode_worker_metrics={self.spec_decode_worker_metrics})")
+ 
+-
+ class Sampler(nn.Module):
+     """Samples the next tokens from the model's outputs.
+ 
+@@ -236,7 +235,39 @@ class Sampler(nn.Module):
+             logits: (num_tokens, vocab_size).
+             sampling_metadata: Metadata for sampling.
+         """
++
++        # 设置并行数，防止并行开销过大
++        torch.set_num_threads(1)
++
+         assert logits is not None
++        # 纯 Greedy 通道：当 temperature==0.0 且未请求任何 logprobs 时，跳过概率/softmax 开销
++        params = sampling_metadata.seq_groups[0].sampling_params
++        if params.temperature < 0.01 and params.logprobs is None and params.prompt_logprobs is None:
++            # 获取每个序列组对应的行索引（decode 阶段一个组对应一行）
++            sample_rows = sampling_metadata.categorized_sample_indices[SamplingType.GREEDY]
++
++
++            # 替代argmax获取token id
++            _, greedy_ids = logits.index_select(0, sample_rows).max(dim=-1)
++
++            outputs: List[CompletionSequenceGroupOutput] = []
++            for i, seq_group in enumerate(sampling_metadata.seq_groups):
++                if seq_group.do_sample:
++                    token_id = int(greedy_ids[i].item())
++                    # Provide a default logprobs mapping for the greedy token
++                    outputs.append(CompletionSequenceGroupOutput(
++                        samples=[SequenceOutput(
++                            seq_group.seq_ids[0], token_id,
++                            {token_id: Logprob(0.0)}
++                        )],
++                        prompt_logprobs=None
++                    ))
++                else:
++                    outputs.append(CompletionSequenceGroupOutput(
++                        samples=[],
++                        prompt_logprobs=None
++                    ))
++            return SamplerOutput(outputs=outputs)
+         _, vocab_size = logits.shape
+ 
+         # Prepare sampling tensors with pinned memory to avoid blocking.
+@@ -446,7 +477,6 @@ def _greedy_sample(
+         same as the length of selected_seq_groups. If the corresponding
+         seq_group has do_sample=False, tuple contains ([], [])
+     """
+-    samples_lst = samples.tolist()
+     sample_idx = 0
+     results: SampleResultType = []
+     for seq_group in selected_seq_groups:
+@@ -459,7 +489,7 @@ def _greedy_sample(
+         assert num_parent_seqs == 1, (
+             "Greedy sampling should have only one seq.")
+         parent_ids = list(range(num_parent_seqs))
+-        next_token_ids = [samples_lst[sample_idx]]
++        next_token_ids = [int(samples[sample_idx].item())]
+         results.append((next_token_ids, parent_ids))
+         sample_idx += num_parent_seqs
+     return results
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index 584320e..bfbd2a1 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -189,6 +189,10 @@ class SamplingParams(
+         extra_args: Arbitrary additional args, that can be used by custom
+             sampling implementations. Not used by any in-tree sampling
+             implementations.
++        request_id_inference: Read the block of this request to continue the inference.
++            Defaults to None.
++        num_decode_tokens: The number of tokens to generate in each step
++            during decoding. Defaults to None.
+     """
+ 
+     n: int = 1
+@@ -237,6 +241,9 @@ class SamplingParams(
+     bad_words: Optional[list[str]] = None
+     _bad_words_token_ids: Optional[list[list[int]]] = None
+ 
++    request_id_inference: Optional[str] = None
++    num_decode_tokens: Optional[int] = None
++
+     @staticmethod
+     def from_optional(
+         n: Optional[int] = 1,
+@@ -269,6 +276,8 @@ class SamplingParams(
+         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
+         allowed_token_ids: Optional[list[int]] = None,
+         extra_args: Optional[dict[str, Any]] = None,
++        request_id_inference: Optional[str] = None,
++        num_decode_tokens: Optional[int] = None,
+     ) -> "SamplingParams":
+         if logit_bias is not None:
+             # Convert token_id to integer
+@@ -311,6 +320,8 @@ class SamplingParams(
+             logit_bias=logit_bias,
+             allowed_token_ids=allowed_token_ids,
+             extra_args=extra_args,
++            request_id_inference=request_id_inference,
++            num_decode_tokens=num_decode_tokens,
+         )
+ 
+     def __post_init__(self) -> None:
+@@ -558,11 +569,13 @@ class SamplingParams(
+             f"logprobs={self.logprobs}, "
+             f"prompt_logprobs={self.prompt_logprobs}, "
+             f"skip_special_tokens={self.skip_special_tokens}, "
+-            "spaces_between_special_tokens="
+-            f"{self.spaces_between_special_tokens}, "
++            f"spaces_between_special_tokens={self.spaces_between_special_tokens}, "
+             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
+             f"guided_decoding={self.guided_decoding}, "
+-            f"extra_args={self.extra_args})")
++            f"extra_args={self.extra_args}, "
++            f"request_id_inference={self.request_id_inference}, "
++            f"num_decode_tokens={self.num_decode_tokens})"
++        )
+ 
+ 
+ class BeamSearchParams(
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 61867b0..3b0108c 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -66,11 +66,16 @@ class SequenceStatus(enum.IntEnum):
+     FINISHED_LENGTH_CAPPED = 4
+     FINISHED_ABORTED = 5
+     FINISHED_IGNORED = 6
++    SCHEDULED = 7
+ 
+     @staticmethod
+     def is_finished(status: "SequenceStatus") -> bool:
+         return status > SequenceStatus.SWAPPED
+ 
++    @staticmethod
++    def is_scheduled(status: "SequenceStatus") -> bool:
++        return status == SequenceStatus.SCHEDULED
++
+     @staticmethod
+     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
+         if status == SequenceStatus.FINISHED_STOPPED:
+@@ -84,6 +89,8 @@ class SequenceStatus(enum.IntEnum):
+             # are longer than the model's length cap. Therefore, the stop
+             # reason should also be "length" as in OpenAI API.
+             finish_reason = "length"
++        elif status == SequenceStatus.SCHEDULED:
++            finish_reason = "scheduled"
+         else:
+             finish_reason = None
+         return finish_reason
+@@ -441,6 +448,7 @@ class Sequence:
+         self.read_offset = 0
+         # Input + output tokens
+         self.tokens: Optional[list[str]] = None
++        self.scheduled_finished = False
+ 
+     @property
+     def n_blocks(self) -> int:
+@@ -589,6 +597,9 @@ class Sequence:
+     def is_finished(self) -> bool:
+         return SequenceStatus.is_finished(self.status)
+ 
++    def is_scheduled(self) -> bool:
++        return SequenceStatus.is_scheduled(self.status)
++
+     def fork(self, new_seq_id: int) -> "Sequence":
+         new_seq = copy.deepcopy(self)
+         new_seq.seq_id = new_seq_id
+@@ -693,6 +704,10 @@ class SequenceGroup:
+         self.priority = priority
+ 
+         self.cached_request_output = None
++        # 用于存储需要在worker端导出的物理块映射信息
++        self.physical_block_mapping: Optional[dict[int, list[int]]] = None
++        # 标记是否已从共享内存加载过 prefill KV 缓存
++        self.is_load_prefill_kvcache = False
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+@@ -894,6 +909,9 @@ class SequenceGroup:
+     def is_prefill(self) -> bool:
+         return self.first_seq.is_prefill()
+ 
++    def is_scheduled(self) -> bool:
++        return self.first_seq.is_scheduled()
++
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
+                 f"sampling_params={self.sampling_params}, "
+@@ -1311,6 +1329,12 @@ class ExecuteModelRequest(
+                                    int]] = msgspec.field(default_factory=list)
+     # Blocks to copy. Source to dest block.
+     blocks_to_copy: list[tuple[int, int]] = msgspec.field(default_factory=list)
++    # Blocks to upload to shared memory. Dict of request_id -> block_mapping.
++    blocks_to_shared_memory_upload: Optional[dict[str,
++                                                  dict[int, list[int]]]] = None
++    # Blocks to download from shared memory. Dict of request_id -> block_mapping.
++    blocks_to_shared_memory_download: Optional[dict[str,
++                                                    dict[int, list[int]]]] = None
+     # Virtual engine ID for pipeline parallel.
+     virtual_engine: int = 0
+     # The number of slots for lookahead decoding.
+@@ -1375,7 +1399,8 @@ class ExecuteModelRequest(
+             finished_requests_ids=self.finished_requests_ids,
+             last_sampled_token_ids=self.last_sampled_token_ids.clone()
+             if self.last_sampled_token_ids is not None else None,
+-            async_callback=self.async_callback)
++            async_callback=self.async_callback,
++            physical_block_mapping=self.physical_block_mapping)
+ 
+ 
+ @dataclass
+diff --git a/vllm/worker/cpu_worker.py b/vllm/worker/cpu_worker.py
+index 70d2924..b24d137 100644
+--- a/vllm/worker/cpu_worker.py
++++ b/vllm/worker/cpu_worker.py
+@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Set, Tuple, Type
+ 
+ import torch
+ import torch.distributed
++import numpy as np
++from multiprocessing import shared_memory
+ 
+ import vllm.envs as envs
+ from vllm.attention import get_attn_backend
+@@ -21,6 +23,8 @@ from vllm.worker.cpu_model_runner import CPUModelRunner, CPUModelRunnerBase
+ from vllm.worker.cpu_pooling_model_runner import CPUPoolingModelRunner
+ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
+                                      WorkerInput)
++from vllm.attention.ops.paged_attn import PagedAttention
++from vllm.core.shared_memory.manager import SharedMemoryManager
+ 
+ logger = init_logger(__name__)
+ 
+@@ -133,6 +137,7 @@ class CPUWorker(LocalOrDistributedWorkerBase):
+         kv_cache_dtype: Optional[str] = "auto",
+         is_driver_worker: bool = False,
+         model_runner_cls: Optional[Type[CPUModelRunner]] = None,
++        shared_memory_manager=None,
+     ) -> None:
+         WorkerBase.__init__(self, vllm_config=vllm_config)
+ 
+@@ -201,6 +206,9 @@ class CPUWorker(LocalOrDistributedWorkerBase):
+         else:
+             self.profiler = None
+ 
++        # 接收从executor传递的共享内存管理器实例
++        self.shared_memory_manager: SharedMemoryManager = shared_memory_manager
++
+     def start_profile(self):
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+@@ -361,6 +369,8 @@ class CPUWorker(LocalOrDistributedWorkerBase):
+         return WorkerInput(
+             num_seq_groups=num_seq_groups,
+             blocks_to_copy=blocks_to_copy,
++            blocks_to_shared_memory_upload=execute_model_req.blocks_to_shared_memory_upload,
++            blocks_to_shared_memory_download=execute_model_req.blocks_to_shared_memory_download,
+             virtual_engine=virtual_engine,
+         )
+ 
+@@ -390,3 +400,168 @@ class CPUWorker(LocalOrDistributedWorkerBase):
+         return CPUCacheEngine.get_cache_block_size(
+             self.cache_config.block_size, self.cache_config.cache_dtype,
+             self.model_config, self.parallel_config)
++
++    def export_physical_blocks_to_shared_memory(
++        self,
++        cache_engine: CPUCacheEngine,
++        block_ids: List[int],
++        request_id: str,
++    ) -> List[Dict]:
++        if not block_ids:
++            return []
++
++        meta_list: List[Dict] = []
++        for block_id in block_ids:
++            layer_blocks = []
++            for layer in cache_engine.cpu_cache:
++                block_data = layer[:, block_id, :]
++                layer_blocks.append(block_data)
++
++            tensor = torch.stack(layer_blocks, dim=0)
++            np_array = tensor.numpy()
++            meta = self.shared_memory_manager.upload_physical_blocks_cpu(
++                request_id, block_id, np_array)
++            meta_list.append(meta)
++
++        return meta_list
++
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        if not physical_block_mapping:
++            return False
++
++        for seq_id, block_ids in physical_block_mapping.items():
++            meta_list = self.export_physical_blocks_to_shared_memory(
++                self.cache_engine[virtual_engine],
++                block_ids,
++                request_id=request_id
++            )
++            self.shared_memory_manager.set_physical_blocks_meta(
++                request_id, meta_list)
++        return True
++
++    def import_physical_blocks_from_shared_memory(
++        self,
++        cache_engine: CPUCacheEngine,
++        request_id: str,
++        block_ids: List[int],
++    ) -> bool:
++        if not block_ids:
++            return False
++
++        kv_cache_data = self.shared_memory_manager.load_logical_block(
++            request_id)
++        if kv_cache_data is None:
++            return False
++
++        device = kv_cache_data.get("device")
++        if device == "cpu":
++            logger.debug(f"同实例，跳过kv cache导入")
++            return True
++
++        meta_list = kv_cache_data.get("physical_blocks_meta")
++        if not meta_list or len(block_ids) < len(meta_list):
++            return False
++
++        tp_world_size = kv_cache_data.get("tp_world_size", 1)
++        for idx, (meta, dest_block_id) in enumerate(zip(meta_list, block_ids)):
++            shm = None
++            try:
++                if tp_world_size > 1:
++                    np_array = self.shared_memory_manager.merge_physical_blocks_meta(
++                        request_id, meta, tp_world_size)
++                else:
++                    shm = shared_memory.SharedMemory(
++                        name=meta['shm_name'], create=False)
++                    np_array = np.ndarray(meta["shape"], dtype=np.dtype(
++                        meta["dtype"]), buffer=shm.buf)
++
++                num_layers, _, block_size, num_heads, head_size = np_array.shape
++
++                for layer_idx, layer_cache in enumerate(cache_engine.cpu_cache):
++                    flash_blocks = np_array[layer_idx]
++                    k_np = flash_blocks[0]
++                    v_np = flash_blocks[1]
++
++                    k_t = torch.from_numpy(k_np).contiguous()
++                    v_t = torch.from_numpy(v_np).contiguous()
++
++                    slot_mapping = torch.arange(
++                        block_size, dtype=torch.int64) + dest_block_id * block_size
++
++                    flat_key = layer_cache[0]
++                    flat_value = layer_cache[1]
++                    x = 16 // flat_key.element_size()
++                    num_blocks = flat_key.shape[0]
++
++                    key_cache = flat_key.view(
++                        num_blocks, num_heads, head_size // x, block_size, x)
++                    value_cache = flat_value.view(
++                        num_blocks, num_heads, head_size, block_size)
++
++                    scale = torch.tensor(
++                        1.0, dtype=torch.float32, device=k_t.device)
++                    PagedAttention.write_to_paged_cache(
++                        key=k_t,
++                        value=v_t,
++                        key_cache=key_cache,
++                        value_cache=value_cache,
++                        slot_mapping=slot_mapping,
++                        kv_cache_dtype=cache_engine.cache_config.cache_dtype,
++                        k_scale=scale,
++                        v_scale=scale
++                    )
++            except Exception as e:
++                logger.error(f"读取物理块时出错: {e}")
++            finally:
++                if shm is not None:
++                    shm.close()
++        return True
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        """
++        从共享内存导入物理块
++        
++        从共享内存读取GPU传来的完整KV缓存数据，
++        并写入本地CPU缓存。
++        
++        Args:
++            virtual_engine: 虚拟引擎ID
++            request_id: 请求ID
++            physical_block_mapping: 物理块映射 {seq_id: [block_ids]}
++            
++        Returns:
++            是否成功导入所有物理块
++        """
++        # 收集所有需要导入的block_ids
++        all_block_ids = []
++        for seq_id, block_ids in physical_block_mapping.items():
++            all_block_ids.extend(block_ids)
++        logger.debug(f"CPU Worker 开始导入 {len(all_block_ids)} 个物理块")
++        if not all_block_ids:
++            return True
++
++        all_block_ids = list(dict.fromkeys(all_block_ids))
++
++        # 导入所有物理块数据
++        success = self.import_physical_blocks_from_shared_memory(
++            self.cache_engine[virtual_engine],
++            request_id=request_id,
++            block_ids=all_block_ids
++        )
++
++        if success:
++            logger.debug(f"CPU Worker: 成功导入 {len(all_block_ids)} 个物理块")
++        else:
++            logger.error(f"CPU Worker: 导入物理块失败")
++
++        return success
+diff --git a/vllm/worker/worker.py b/vllm/worker/worker.py
+index 5f39a60..58d8144 100644
+--- a/vllm/worker/worker.py
++++ b/vllm/worker/worker.py
+@@ -13,6 +13,8 @@ from vllm.device_allocator.cumem import CuMemAllocator
+ from vllm.distributed import (ensure_kv_transfer_initialized,
+                               ensure_model_parallel_initialized,
+                               init_distributed_environment,
++                              get_tensor_model_parallel_rank,
++                              get_tensor_model_parallel_world_size,
+                               set_custom_all_reduce)
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+@@ -30,7 +32,10 @@ from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
+ from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
+ from vllm.worker.pooling_model_runner import PoolingModelRunner
+ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
+-                                     WorkerInput)
++                                     WorkerInput, extract_previous_hidden_states)
++from multiprocessing import shared_memory
++import numpy as np
++from vllm.core.shared_memory.manager import SharedMemoryManager
+ 
+ logger = init_logger(__name__)
+ 
+@@ -51,6 +56,7 @@ class Worker(LocalOrDistributedWorkerBase):
+         distributed_init_method: str,
+         is_driver_worker: bool = False,
+         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
++        shared_memory_manager=None,
+     ) -> None:
+         WorkerBase.__init__(self, vllm_config)
+         self.parallel_config.rank = rank
+@@ -112,6 +118,9 @@ class Worker(LocalOrDistributedWorkerBase):
+         else:
+             self.profiler = None
+ 
++        # 接收从executor传递的共享内存管理器实例
++        self.shared_memory_manager: SharedMemoryManager = shared_memory_manager
++
+     def start_profile(self):
+         if self.profiler is None:
+             raise RuntimeError("Profiler is not enabled.")
+@@ -374,6 +383,8 @@ class Worker(LocalOrDistributedWorkerBase):
+             blocks_to_swap_in=blocks_to_swap_in,
+             blocks_to_swap_out=blocks_to_swap_out,
+             blocks_to_copy=blocks_to_copy,
++            blocks_to_shared_memory_upload=execute_model_req.blocks_to_shared_memory_upload,
++            blocks_to_shared_memory_download=execute_model_req.blocks_to_shared_memory_download,
+             virtual_engine=virtual_engine,
+             num_steps=num_steps,
+         )
+@@ -394,6 +405,28 @@ class Worker(LocalOrDistributedWorkerBase):
+                 and worker_input.blocks_to_copy.numel() > 0):
+             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+ 
++        # 处理共享内存上传
++        if (worker_input.blocks_to_shared_memory_upload is not None
++                and len(worker_input.blocks_to_shared_memory_upload) > 0):
++            # 格式: {request_id: physical_block_mapping}
++            for request_id, physical_block_mapping in worker_input.blocks_to_shared_memory_upload.items():
++                self.copy_block_to_sharememory(
++                    virtual_engine,
++                    request_id,
++                    physical_block_mapping
++                )
++
++        # 处理共享内存下载
++        if (worker_input.blocks_to_shared_memory_download is not None
++                and len(worker_input.blocks_to_shared_memory_download) > 0):
++            # 格式: {request_id: physical_block_mapping}
++            for request_id, physical_block_mapping in worker_input.blocks_to_shared_memory_download.items():
++                self.copy_block_from_sharememory(
++                    virtual_engine,
++                    request_id,
++                    physical_block_mapping
++                )
++
+     def _get_cached_seq_group_metadata(
+             self,
+             seq_group_metadata_list: List[Union[SequenceGroupMetadata,
+@@ -491,6 +524,425 @@ class Worker(LocalOrDistributedWorkerBase):
+                                                 self.model_config,
+                                                 self.parallel_config)
+ 
++    # 重写execute_model方法，专门处理共享内存操作
++    @torch.inference_mode()
++    def execute_model(
++        self,
++        execute_model_req: Optional[ExecuteModelRequest] = None,
++    ) -> Optional[List[SamplerOutput]]:
++        """
++        执行模型推理，支持共享内存操作的特殊处理
++
++        当检测到共享内存操作时（空的seq_group_metadata_list但包含共享内存字段），
++        会使用简化的处理流程，避免构建attention metadata导致的错误。
++        对于remote worker，会检查broadcast data来判断是否为共享内存操作。
++
++        Args:
++            execute_model_req: 模型执行请求，包含序列组元数据和共享内存操作信息
++
++        Returns:
++            模型输出结果列表，共享内存操作返回空列表
++        """
++        # 检查是否为共享内存操作
++        if (execute_model_req is not None and
++            execute_model_req.seq_group_metadata_list is not None and
++            len(execute_model_req.seq_group_metadata_list) == 0 and
++            (execute_model_req.blocks_to_shared_memory_upload is not None or
++             execute_model_req.blocks_to_shared_memory_download is not None)):
++
++            # 这是一个共享内存操作请求，使用简化的处理流程
++            return self._execute_shared_memory_operation(execute_model_req)
++
++        # 对于remote worker，检查broadcast data是否为共享内存操作
++        if (execute_model_req is None and not self.is_driver_worker and self.do_metadata_broadcast):
++            # Remote worker情况：先查看broadcast data以判断是否为共享内存操作
++            return self._handle_remote_worker_execution()
++
++        # 否则使用默认的execute_model流程
++        return super().execute_model(execute_model_req)
++
++    def _handle_remote_worker_execution(self) -> Optional[List[SamplerOutput]]:
++        """
++        处理remote worker的执行逻辑，确保共享内存操作的正确分发
++
++        remote worker需要通过broadcast接收driver worker的指令。
++        此方法会检查broadcast data中是否包含共享内存操作，
++        如果是则直接处理，否则重构完整的执行流程。
++
++        Returns:
++            模型输出结果列表，共享内存操作返回空列表
++        """
++        try:
++            # 接收broadcast data
++            broadcast_data = broadcast_tensor_dict(src=0)
++            if not broadcast_data:
++                return None
++
++            # 检查是否包含共享内存操作
++            has_shared_memory_op = (
++                broadcast_data.get("blocks_to_shared_memory_upload") is not None or
++                broadcast_data.get(
++                    "blocks_to_shared_memory_download") is not None
++            )
++
++            if has_shared_memory_op and broadcast_data.get("num_seq_groups") == 0:
++                # 这是共享内存操作，直接处理worker input
++                worker_input = WorkerInput.from_broadcasted_tensor_dict(
++                    broadcast_data)
++                self.execute_worker(worker_input)
++                return []
++            else:
++                # 这不是共享内存操作，但是我们已经消费了broadcast_data
++                # 我们需要用这个数据重新构建inputs
++                worker_input = WorkerInput.from_broadcasted_tensor_dict(
++                    broadcast_data)
++                model_input = (
++                    self.model_runner.make_model_input_from_broadcasted_tensor_dict(
++                        broadcast_data))
++
++                kwargs = extract_previous_hidden_states(broadcast_data)
++
++                # 执行标准流程
++                self.execute_worker(worker_input)
++
++                if worker_input.num_seq_groups == 0:
++                    return []
++
++                # 执行模型
++                output = self.model_runner.execute_model(
++                    model_input=model_input,
++                    kv_caches=self.kv_cache[worker_input.virtual_engine]
++                    if self.kv_cache is not None else None,
++                    num_steps=worker_input.num_steps,
++                    **kwargs,
++                )
++                return output
++
++        except Exception as e:
++            logger.error(f"Remote worker处理执行时出错: {e}")
++            # 如果出错，回退到默认处理
++            return super().execute_model(None)
++
++    def _execute_shared_memory_operation(
++        self,
++        execute_model_req: ExecuteModelRequest
++    ) -> Optional[List[SamplerOutput]]:
++        """
++        处理共享内存操作，绕过attention metadata构建
++
++        共享内存操作不需要构建attention metadata，因为没有实际的序列数据处理。
++        driver worker负责广播指令，remote worker接收并执行相应的共享内存操作。
++
++        Args:
++            execute_model_req: 包含共享内存操作信息的执行请求
++
++        Returns:
++            空列表，因为共享内存操作不产生模型输出
++        """
++        if self.is_driver_worker:
++            # Driver worker: 准备并广播worker input
++            worker_input = self.prepare_worker_input(execute_model_req)
++
++            if self.do_metadata_broadcast:
++                # 广播完整的worker input数据
++                broadcast_data = worker_input.as_broadcastable_tensor_dict()
++                broadcast_tensor_dict(broadcast_data, src=0)
++        else:
++            # Remote worker: 接收广播的数据并重建worker_input
++            if self.do_metadata_broadcast:
++                broadcast_data = broadcast_tensor_dict(src=0)
++                if not broadcast_data:
++                    return None
++                worker_input = WorkerInput.from_broadcasted_tensor_dict(
++                    broadcast_data)
++            else:
++                # 不应该到达这里，因为共享内存操作需要多worker协作
++                logger.error("共享内存操作需要多worker协作，但do_metadata_broadcast为False")
++                return []
++
++        # 执行worker操作（包括共享内存操作）
++        self.execute_worker(worker_input)
++
++        # 共享内存操作不产生模型输出
++        return []
++
++    # 导出物理块到共享内存
++    def export_physical_blocks_to_shared_memory(
++        self,
++        cache_engine: CacheEngine,
++        block_ids: List[int],
++        request_id: str,
++    ) -> bool:
++        """导出当前worker的物理块数据到manager并直接上传"""
++        if not block_ids:
++            return True
++
++        # 获取tensor并行的rank信息
++        tp_rank = get_tensor_model_parallel_rank()
++        tp_world_size = get_tensor_model_parallel_world_size()
++
++        logger.debug(f"Worker rank={tp_rank} 开始导出 {len(block_ids)} 个物理块")
++
++        meta_list = []
++
++        for block_id in block_ids:
++            # 提取当前worker的KV数据
++            layer_blocks = []
++            for layer in cache_engine.gpu_cache:
++                # 每个layer是一个tuple: (k_cache, v_cache)
++                k_cache, v_cache = layer
++                # 提取当前block的数据: [block_size, num_heads, head_size]
++                # [block_size, num_heads, head_size]
++                k_block = k_cache[block_id]
++                # [block_size, num_heads, head_size]
++                v_block = v_cache[block_id]
++
++                # 重新排列为标准格式: [2, block_size, num_heads, head_size]
++                kv_block = torch.stack([k_block, v_block], dim=0)
++                layer_blocks.append(kv_block)
++
++            # 堆叠所有layers: [num_layers, 2, block_size, num_heads, head_size]
++            current_tensor = torch.stack(layer_blocks, dim=0)
++
++            # 转换为numpy用于传输
++            numpy_data = current_tensor.cpu().numpy()
++            worker_data = {
++                "block_id": block_id,
++                "tp_rank": tp_rank,
++                "tp_world_size": tp_world_size,
++                "data": numpy_data,
++                "shape": current_tensor.shape,
++                "dtype": str(numpy_data.dtype),  # 使用numpy的dtype
++                "device": "gpu"
++            }
++
++            # 直接上传碎片到manager
++            success = self.shared_memory_manager.upload_physical_blocks_gpu(
++                request_id, block_id, tp_rank, worker_data)
++
++            if not success:
++                logger.error(
++                    f"Worker rank={tp_rank}: 上传block_id={block_id} 失败")
++                return False
++
++            logger.debug(f"Worker rank={tp_rank}: 成功上传block_id={block_id}")
++
++            # 只有rank_0负责收集meta信息
++            if tp_rank == 0:
++                shm_name = self.shared_memory_manager.get_physical_block_name(
++                    request_id, block_id, 0)
++                meta = {
++                    "block_id": block_id,
++                    "shm_name": shm_name,
++                    "shape": current_tensor.shape,
++                    "dtype": str(numpy_data.dtype),  # 使用numpy的dtype
++                    "nbytes": numpy_data.nbytes,
++                }
++                meta_list.append(meta)
++
++        logger.debug(f"Worker rank={tp_rank} 导出完成，已上传 {len(block_ids)} 个物理块")
++
++        if tp_rank == 0:
++            self.shared_memory_manager.set_physical_blocks_meta(
++                request_id, meta_list, tp_world_size)
++        return True
++
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        if not physical_block_mapping:
++            return False
++
++        for seq_id, block_ids in physical_block_mapping.items():
++            success = self.export_physical_blocks_to_shared_memory(
++                self.cache_engine[virtual_engine],
++                block_ids,
++                request_id=request_id
++            )
++            if not success:
++                logger.error(
++                    f"Worker rank={self.rank}: 导出seq_id={seq_id} 的块失败")
++                return False
++
++        return True
++
++    # 从共享内存导入物理块
++    def import_physical_blocks_from_shared_memory(
++        self,
++        cache_engine: CacheEngine,
++        request_id: str,
++        block_ids: List[int],
++    ) -> bool:
++        if not block_ids:
++            return False
++
++        kv_cache_data = self.shared_memory_manager.load_logical_block(
++            request_id)
++        if kv_cache_data is None:
++            return False
++        meta_list = kv_cache_data.get("physical_blocks_meta")
++        if not meta_list:
++            return False
++
++        try:
++            shared_memories = []
++
++            for idx, meta in enumerate(meta_list):
++                shm = shared_memory.SharedMemory(
++                    name=meta["shm_name"], create=False)
++                shared_memories.append(shm)
++                raw_data = np.frombuffer(
++                    shm.buf, dtype=np.float16).reshape(meta["shape"]).copy()
++                logger.debug(
++                    f"GPU 导入物理块: meta_shape={meta['shape']}, raw_data.shape={raw_data.shape}")
++
++                # 确保使用正确的目标block_id
++                if idx < len(block_ids):
++                    dest_block_id = block_ids[idx]
++                else:
++                    dest_block_id = meta.get("block_id", block_ids[0])
++
++                # 获取tensor并行信息
++                tp_rank = get_tensor_model_parallel_rank()
++                tp_world_size = get_tensor_model_parallel_world_size()
++
++                logger.debug(
++                    f"GPU import: tp_rank={tp_rank}, tp_world_size={tp_world_size}")
++
++                for layer_idx in range(raw_data.shape[0]):
++                    if layer_idx >= len(cache_engine.gpu_cache):
++                        break
++
++                    layer_data = raw_data[layer_idx]  # [2, flat_size]
++
++                    block_size = cache_engine.block_size
++                    num_kv_heads = cache_engine.num_kv_heads
++                    head_size = cache_engine.head_size
++
++                    # 计算当前GPU应该处理的数据范围
++                    # 通用逻辑：适用于单GPU和多GPU情况
++                    # 从flat_size推算total_heads
++                    total_heads = layer_data.shape[1] // (
++                        block_size * head_size)
++                    heads_per_gpu = total_heads // tp_world_size
++
++                    # 计算当前GPU的数据范围
++                    head_start = tp_rank * heads_per_gpu
++                    head_end = head_start + heads_per_gpu
++
++                    # 计算在扁平化数据中的索引范围
++                    flat_start = head_start * block_size * head_size
++                    flat_end = head_end * block_size * head_size
++
++                    # 提取当前GPU的数据部分
++                    # [heads_per_gpu * block_size * head_size]
++                    key_flat = layer_data[0][flat_start:flat_end]
++                    # [heads_per_gpu * block_size * head_size]
++                    value_flat = layer_data[1][flat_start:flat_end]
++
++                    key_flat_tensor = torch.from_numpy(key_flat).to(
++                        device=cache_engine.gpu_cache[layer_idx][0].device,
++                        dtype=torch.float16
++                    )
++                    value_flat_tensor = torch.from_numpy(value_flat).to(
++                        device=cache_engine.gpu_cache[layer_idx][1].device,
++                        dtype=torch.float16
++                    )
++
++                    x = 16 // 2  # fp16 -> x=8
++
++                    # Value处理：使用当前GPU的head数量
++                    value_reshaped = value_flat_tensor.view(
++                        num_kv_heads, head_size, block_size)
++                    value_data = value_reshaped.permute(2, 0, 1)
++
++                    # Key处理：使用当前GPU的head数量
++                    key_temp = key_flat_tensor.view(
++                        num_kv_heads, head_size // x, block_size, x)
++                    key_temp = key_temp.permute(2, 0, 1, 3)
++                    key_data = key_temp.reshape(
++                        block_size, num_kv_heads, head_size)
++
++                    k_cache, v_cache = cache_engine.gpu_cache[layer_idx]
++                    k_cache[dest_block_id] = key_data
++                    v_cache[dest_block_id] = value_data
++
++            return True
++
++        except Exception as e:
++            logger.error(f"导入物理块时出错: {e}")
++            return False
++        finally:
++            for shm in shared_memories:
++                try:
++                    shm.close()
++                except:
++                    pass
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        """
++        从共享内存导入物理块
++
++        从共享内存读取CPU传来的完整KV缓存数据，
++        根据当前worker的tensor parallel rank切割自己的部分并写入本地缓存。
++
++        Args:
++            virtual_engine: 虚拟引擎ID
++            request_id: 请求ID
++            physical_block_mapping: 物理块映射 {seq_id: [block_ids]}
++
++        Returns:
++            是否成功导入所有物理块
++        """
++        # 收集所有需要导入的block_ids
++        all_block_ids = []
++        for seq_id, block_ids in physical_block_mapping.items():
++            all_block_ids.extend(block_ids)
++
++        logger.debug(f"Worker rank={self.rank} 开始导入 {len(all_block_ids)} 个物理块")
++
++        if not all_block_ids:
++            return True
++
++        # 导入所有物理块数据
++        success = self.import_physical_blocks_from_shared_memory(
++            self.cache_engine[virtual_engine], request_id, all_block_ids
++        )
++
++        if success:
++            logger.debug(f"Worker rank={self.rank}: 成功导入 {len(all_block_ids)} 个物理块")
++        else:
++            logger.error(f"Worker rank={self.rank}: 导入物理块失败")
++
++        return success
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req: Optional[ExecuteModelRequest] = None
++    ) -> None:
++        _, worker_input, _ = self.prepare_input(
++            execute_model_req=execute_model_req)
++        virtual_engine = worker_input.virtual_engine
++        # Issue cache operations.
++        if (worker_input.blocks_to_swap_in is not None
++                and worker_input.blocks_to_swap_in.numel() > 0):
++            self.cache_engine[virtual_engine].swap_in(
++                worker_input.blocks_to_swap_in)
++        if (worker_input.blocks_to_swap_out is not None
++                and worker_input.blocks_to_swap_out.numel() > 0):
++            self.cache_engine[virtual_engine].swap_out(
++                worker_input.blocks_to_swap_out)
++        if (worker_input.blocks_to_copy is not None
++                and worker_input.blocks_to_copy.numel() > 0):
++            self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+ 
+ def init_worker_distributed_environment(
+     vllm_config: VllmConfig,
+diff --git a/vllm/worker/worker_base.py b/vllm/worker/worker_base.py
+index cebf541..fe1b84e 100644
+--- a/vllm/worker/worker_base.py
++++ b/vllm/worker/worker_base.py
+@@ -147,6 +147,28 @@ class WorkerBase:
+         """Get vocabulary size from model configuration."""
+         return self.model_config.get_vocab_size()
+ 
++    def copy_block_to_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        return self.worker.copy_block_to_sharememory(virtual_engine, request_id, physical_block_mapping)
++
++    def copy_block_from_sharememory(
++        self,
++        virtual_engine: int,
++        request_id: str,
++        physical_block_mapping: dict[int, List[int]]
++    ) -> bool:
++        return self.worker.copy_block_from_sharememory(virtual_engine, request_id, physical_block_mapping)
++
++    def swap_block_gpu_cpu(
++        self,
++        execute_model_req: Optional[ExecuteModelRequest] = None
++    ) -> None:
++        return self.worker.swap_block_gpu_cpu(execute_model_req)
++
+ 
+ class DelegateWorkerBase(WorkerBase):
+     """
+@@ -236,6 +258,10 @@ class WorkerInput:
+     blocks_to_swap_in: Optional[torch.Tensor] = None
+     blocks_to_swap_out: Optional[torch.Tensor] = None
+     blocks_to_copy: Optional[torch.Tensor] = None
++    blocks_to_shared_memory_upload: Optional[Dict[str,
++                                                  Dict[int, List[int]]]] = None
++    blocks_to_shared_memory_download: Optional[Dict[str,
++                                                    Dict[int, List[int]]]] = None
+     virtual_engine: int = 0
+     num_steps: int = 1
+ 
+@@ -253,8 +279,12 @@ class WorkerInput:
+             blocks_to_swap_in=tensor_dict.pop("blocks_to_swap_in"),
+             blocks_to_swap_out=tensor_dict.pop("blocks_to_swap_out"),
+             blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
++            blocks_to_shared_memory_upload=tensor_dict.pop(
++                "blocks_to_shared_memory_upload", None),
++            blocks_to_shared_memory_download=tensor_dict.pop(
++                "blocks_to_shared_memory_download", None),
+             virtual_engine=tensor_dict["virtual_engine"],
+-            num_steps=tensor_dict.pop("num_steps"),
++            num_steps=tensor_dict.pop("num_steps")
+         )
+ 
+     def as_broadcastable_tensor_dict(
+@@ -267,8 +297,10 @@ class WorkerInput:
+             "blocks_to_swap_in": self.blocks_to_swap_in,
+             "blocks_to_swap_out": self.blocks_to_swap_out,
+             "blocks_to_copy": self.blocks_to_copy,
++            "blocks_to_shared_memory_upload": self.blocks_to_shared_memory_upload,
++            "blocks_to_shared_memory_download": self.blocks_to_shared_memory_download,
+             "virtual_engine": self.virtual_engine,
+-            "num_steps": self.num_steps,
++            "num_steps": self.num_steps
+         }
+ 
+         return tensor_dict
+@@ -575,6 +607,7 @@ class WorkerWrapperBase:
+         self,
+         vllm_config: VllmConfig,
+         rpc_rank: int = 0,
++        shared_memory_manager=None,
+     ) -> None:
+         """
+         Initialize the worker wrapper with the given vllm_config and rpc_rank.
+@@ -587,6 +620,8 @@ class WorkerWrapperBase:
+         group.
+         """
+         self.rpc_rank = rpc_rank
++        # Store shared memory manager for KV cache operations
++        self.shared_memory_manager = shared_memory_manager
+         self.worker: Optional[WorkerBase] = None
+         # do not store this `vllm_config`, `init_worker` will set the final
+         # one. TODO: investigate if we can remove this field in
+@@ -625,6 +660,7 @@ class WorkerWrapperBase:
+         Arguments are passed to the worker class constructor.
+         """
+         kwargs = all_kwargs[self.rpc_rank]
++        kwargs.setdefault('shared_memory_manager', self.shared_memory_manager)
+         self.vllm_config = kwargs.get("vllm_config", None)
+         assert self.vllm_config is not None, (
+             "vllm_config is required to initialize the worker")
+x
