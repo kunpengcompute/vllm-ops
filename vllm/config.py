@@ -3248,6 +3248,8 @@ def _get_and_verify_dtype(
                 config_dtype,
                 is_pooling_model=is_pooling_model,
             )
+            if config_dtype != torch.float32:
+                torch_dtype = torch.float16
         else:
             if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
                 raise ValueError(f"Unknown dtype: {dtype!r}")
@@ -4234,6 +4236,8 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    enable_auto_pd_offload: bool = False
+    """Enable automatic PD offload to shared memory."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
 

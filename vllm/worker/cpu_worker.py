@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed
+import numpy as np
+from multiprocessing import shared_memory
 
 import vllm.envs as envs
 from vllm.attention import get_attn_backend
@@ -24,6 +26,8 @@ from vllm.worker.cpu_model_runner import CPUModelRunner, CPUModelRunnerBase
 from vllm.worker.cpu_pooling_model_runner import CPUPoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
+from vllm.attention.ops.paged_attn import PagedAttention
+from vllm.core.shared_memory.manager import SharedMemoryManager
 
 logger = init_logger(__name__)
 
@@ -137,6 +141,7 @@ class CPUWorker(LocalOrDistributedWorkerBase):
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[CPUModelRunner]] = None,
+        shared_memory_manager=None,
     ) -> None:
         WorkerBase.__init__(self, vllm_config=vllm_config)
 
@@ -208,6 +213,9 @@ class CPUWorker(LocalOrDistributedWorkerBase):
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+
+        # 接收从executor传递的共享内存管理器实例
+        self.shared_memory_manager: SharedMemoryManager = shared_memory_manager
 
     def start_profile(self):
         if self.profiler is None:
@@ -373,6 +381,8 @@ class CPUWorker(LocalOrDistributedWorkerBase):
         return WorkerInput(
             num_seq_groups=num_seq_groups,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_shared_memory_upload=execute_model_req.blocks_to_shared_memory_upload,
+            blocks_to_shared_memory_download=execute_model_req.blocks_to_shared_memory_download,
             virtual_engine=virtual_engine,
         )
 
@@ -448,3 +458,168 @@ class CPUWorker(LocalOrDistributedWorkerBase):
                 "fallback to no thread-binding. To get better performance,"
                 "please try to manually bind threads.")
         return rank_to_cpus
+
+    def export_physical_blocks_to_shared_memory(
+        self,
+        cache_engine: CPUCacheEngine,
+        block_ids: List[int],
+        request_id: str,
+    ) -> List[Dict]:
+        if not block_ids:
+            return []
+
+        meta_list: List[Dict] = []
+        for block_id in block_ids:
+            layer_blocks = []
+            for layer in cache_engine.cpu_cache:
+                block_data = layer[:, block_id, :]
+                layer_blocks.append(block_data)
+
+            tensor = torch.stack(layer_blocks, dim=0)
+            np_array = tensor.numpy()
+            meta = self.shared_memory_manager.upload_physical_blocks_cpu(
+                request_id, block_id, np_array)
+            meta_list.append(meta)
+
+        return meta_list
+
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        if not physical_block_mapping:
+            return False
+
+        for seq_id, block_ids in physical_block_mapping.items():
+            meta_list = self.export_physical_blocks_to_shared_memory(
+                self.cache_engine[virtual_engine],
+                block_ids,
+                request_id=request_id
+            )
+            self.shared_memory_manager.set_physical_blocks_meta(
+                request_id, meta_list)
+        return True
+
+    def import_physical_blocks_from_shared_memory(
+        self,
+        cache_engine: CPUCacheEngine,
+        request_id: str,
+        block_ids: List[int],
+    ) -> bool:
+        if not block_ids:
+            return False
+
+        kv_cache_data = self.shared_memory_manager.load_logical_block(
+            request_id)
+        if kv_cache_data is None:
+            return False
+
+        device = kv_cache_data.get("device")
+        if device == "cpu":
+            logger.debug(f"同实例，跳过kv cache导入")
+            return True
+
+        meta_list = kv_cache_data.get("physical_blocks_meta")
+        if not meta_list or len(block_ids) < len(meta_list):
+            return False
+
+        tp_world_size = kv_cache_data.get("tp_world_size", 1)
+        for idx, (meta, dest_block_id) in enumerate(zip(meta_list, block_ids)):
+            shm = None
+            try:
+                if tp_world_size > 1:
+                    np_array = self.shared_memory_manager.merge_physical_blocks_meta(
+                        request_id, meta, tp_world_size)
+                else:
+                    shm = shared_memory.SharedMemory(
+                        name=meta['shm_name'], create=False)
+                    np_array = np.ndarray(meta["shape"], dtype=np.dtype(
+                        meta["dtype"]), buffer=shm.buf)
+
+                num_layers, _, block_size, num_heads, head_size = np_array.shape
+
+                for layer_idx, layer_cache in enumerate(cache_engine.cpu_cache):
+                    flash_blocks = np_array[layer_idx]
+                    k_np = flash_blocks[0]
+                    v_np = flash_blocks[1]
+
+                    k_t = torch.from_numpy(k_np).contiguous()
+                    v_t = torch.from_numpy(v_np).contiguous()
+
+                    slot_mapping = torch.arange(
+                        block_size, dtype=torch.int64) + dest_block_id * block_size
+
+                    flat_key = layer_cache[0]
+                    flat_value = layer_cache[1]
+                    x = 16 // flat_key.element_size()
+                    num_blocks = flat_key.shape[0]
+
+                    key_cache = flat_key.view(
+                        num_blocks, num_heads, head_size // x, block_size, x)
+                    value_cache = flat_value.view(
+                        num_blocks, num_heads, head_size, block_size)
+
+                    scale = torch.tensor(
+                        1.0, dtype=torch.float32, device=k_t.device)
+                    PagedAttention.write_to_paged_cache(
+                        key=k_t,
+                        value=v_t,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        slot_mapping=slot_mapping,
+                        kv_cache_dtype=cache_engine.cache_config.cache_dtype,
+                        k_scale=scale,
+                        v_scale=scale
+                    )
+            except Exception as e:
+                logger.error(f"读取物理块时出错: {e}")
+            finally:
+                if shm is not None:
+                    shm.close()
+        return True
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        """
+        从共享内存导入物理块
+        
+        从共享内存读取GPU传来的完整KV缓存数据，
+        并写入本地CPU缓存。
+        
+        Args:
+            virtual_engine: 虚拟引擎ID
+            request_id: 请求ID
+            physical_block_mapping: 物理块映射 {seq_id: [block_ids]}
+            
+        Returns:
+            是否成功导入所有物理块
+        """
+        # 收集所有需要导入的block_ids
+        all_block_ids = []
+        for seq_id, block_ids in physical_block_mapping.items():
+            all_block_ids.extend(block_ids)
+        logger.debug(f"CPU Worker 开始导入 {len(all_block_ids)} 个物理块")
+        if not all_block_ids:
+            return True
+
+        all_block_ids = list(dict.fromkeys(all_block_ids))
+
+        # 导入所有物理块数据
+        success = self.import_physical_blocks_from_shared_memory(
+            self.cache_engine[virtual_engine],
+            request_id=request_id,
+            block_ids=all_block_ids
+        )
+
+        if success:
+            logger.debug(f"CPU Worker: 成功导入 {len(all_block_ids)} 个物理块")
+        else:
+            logger.error(f"CPU Worker: 导入物理块失败")
+
+        return success

@@ -104,7 +104,8 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
 
-        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0)
+        self.driver_worker = WorkerWrapperBase(self.vllm_config, 0,
+                                               shared_memory_manager=self.shared_memory_manager)
 
         all_kwargs = []
         distributed_init_method = get_distributed_init_method(
@@ -119,6 +120,7 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
                 distributed_init_method=distributed_init_method,
                 is_driver_worker=(not self.parallel_config)
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
+                shared_memory_manager=self.shared_memory_manager,
             )
             all_kwargs.append(kwargs)
         self._run_workers("init_worker", all_kwargs)
@@ -242,3 +244,67 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
             for worker in self.non_driver_workers
         ]
         return await asyncio.gather(*coros)
+
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        # 通过ExecuteModelRequest传递共享内存操作
+        blocks_to_shared_memory_upload = {
+            request_id: physical_block_mapping
+        }
+        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[],  # 空列表而不是None
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            blocks_to_shared_memory_upload=blocks_to_shared_memory_upload,
+            blocks_to_shared_memory_download=None,
+            virtual_engine=virtual_engine,
+            num_steps=1,
+            finished_requests_ids=[],
+            num_lookahead_slots=0,
+        )
+        # 通过driver执行共享内存操作
+        self._driver_execute_model(execute_model_req)
+        return True
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        # 通过ExecuteModelRequest传递共享内存操作，而不是直接使用collective_rpc
+        blocks_to_shared_memory_download = {
+            request_id: physical_block_mapping
+        }
+
+        # 创建ExecuteModelRequest，使用空的seq_group_metadata_list避免attention metadata错误
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[],  # 空列表而不是None
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            blocks_to_shared_memory_upload=None,
+            blocks_to_shared_memory_download=blocks_to_shared_memory_download,
+            virtual_engine=virtual_engine,
+            num_steps=1,
+            finished_requests_ids=[],
+            num_lookahead_slots=0,
+        )
+        # 通过driver执行共享内存操作
+        self._driver_execute_model(execute_model_req)
+        return True
+
+    def swap_block_gpu_cpu(
+        self,
+        execute_model_req=None
+    ) -> None:
+        self.collective_rpc(
+            "swap_block_gpu_cpu",
+            args=(execute_model_req,),
+        )

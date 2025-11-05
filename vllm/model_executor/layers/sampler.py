@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import inf
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import msgspec
 import torch
@@ -248,6 +248,31 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
+        # 纯 Greedy 通道：当 temperature==0.0 且未请求任何 logprobs 时，跳过概率/softmax 开销
+        params = sampling_metadata.seq_groups[0].sampling_params
+        if params.temperature < 0.01 and params.logprobs is None and params.prompt_logprobs is None:
+            # 获取每个序列组对应的行索引（decode 阶段一个组对应一行）
+            sample_rows = sampling_metadata.categorized_sample_indices[SamplingType.GREEDY]
+            # 直接 argmax 获取 token id
+            greedy_ids = torch.argmax(logits[sample_rows], dim=-1)
+            outputs: List[CompletionSequenceGroupOutput] = []
+            for i, seq_group in enumerate(sampling_metadata.seq_groups):
+                if seq_group.do_sample:
+                    token_id = int(greedy_ids[i].item())
+                    # Provide a default logprobs mapping for the greedy token
+                    outputs.append(CompletionSequenceGroupOutput(
+                        samples=[SequenceOutput(
+                            seq_group.seq_ids[0], token_id,
+                            {token_id: Logprob(0.0)}
+                        )],
+                        prompt_logprobs=None
+                    ))
+                else:
+                    outputs.append(CompletionSequenceGroupOutput(
+                        samples=[],
+                        prompt_logprobs=None
+                    ))
+            return SamplerOutput(outputs=outputs)
         _, vocab_size = logits.shape
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
@@ -457,7 +482,6 @@ def _greedy_sample(
         same as the length of selected_seq_groups. If the corresponding
         seq_group has do_sample=False, tuple contains ([], [])
     """
-    samples_lst = samples.tolist()
     sample_idx = 0
     results: SampleResultType = []
     for seq_group in selected_seq_groups:
@@ -470,7 +494,7 @@ def _greedy_sample(
         assert num_parent_seqs == 1, (
             "Greedy sampling should have only one seq.")
         parent_ids = list(range(num_parent_seqs))
-        next_token_ids = [samples_lst[sample_idx]]
+        next_token_ids = [int(samples[sample_idx].item())]
         results.append((next_token_ids, parent_ids))
         sample_idx += num_parent_seqs
     return results

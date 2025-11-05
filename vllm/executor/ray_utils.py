@@ -39,8 +39,9 @@ try:
         """Ray wrapper for vllm.worker.Worker, allowing Worker to be
         lazily initialized after Ray sets CUDA_VISIBLE_DEVICES."""
 
-        def __init__(self, *args, **kwargs) -> None:
+        def __init__(self, shared_memory_manager=None, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
+            self.shared_memory_manager = shared_memory_manager
             # Since the compiled DAG runs a main execution
             # in a different thread that calls cuda.set_device.
             # The flag indicates is set_device is called on
@@ -137,6 +138,12 @@ try:
             if isinstance(output, IntermediateTensors):
                 output = scheduler_output, output
             return output
+
+        def init_worker(self, *args, **kwargs):
+            """Override init_worker to pass shared_memory_manager."""
+            if "shared_memory_manager" not in kwargs:
+                kwargs["shared_memory_manager"] = self.shared_memory_manager
+            return super().init_worker(*args, **kwargs)
 
         def override_env_vars(self, vars: Dict[str, str]):
             os.environ.update(vars)

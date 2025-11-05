@@ -8,6 +8,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# 屏蔽resource_tracker的共享内存警告
+# 这些警告通常是由于跨实例清理共享内存导致的，属于正常现象
+existing_warnings = os.environ.get('PYTHONWARNINGS', '')
+if existing_warnings:
+    os.environ['PYTHONWARNINGS'] = f"{existing_warnings},ignore::UserWarning:multiprocessing.resource_tracker"
+else:
+    os.environ['PYTHONWARNINGS'] = "ignore::UserWarning:multiprocessing.resource_tracker"
+
 # set some common config/environment variables that should be set
 # for all processes created by vllm and all processes
 # that interact with vllm workers.

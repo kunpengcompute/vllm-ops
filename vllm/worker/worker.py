@@ -13,7 +13,10 @@ from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
-                              set_custom_all_reduce)
+                              set_custom_all_reduce,
+                              broadcast_tensor_dict,
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -31,7 +34,10 @@ from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
-                                     WorkerInput)
+                                     WorkerInput, extract_previous_hidden_states)
+from multiprocessing import shared_memory
+import numpy as np
+from vllm.core.shared_memory.manager import SharedMemoryManager
 
 logger = init_logger(__name__)
 
@@ -52,6 +58,7 @@ class Worker(LocalOrDistributedWorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
+        shared_memory_manager=None,
     ) -> None:
         WorkerBase.__init__(self, vllm_config)
         self.parallel_config.rank = rank
@@ -76,8 +83,8 @@ class Worker(LocalOrDistributedWorkerBase):
                         "mlp_speculator",
                         "eagle",
                         "deepseek_mtp",
-                         "mimo_mtp")) \
-                    else {"return_hidden_states": True}
+                        "mimo_mtp")) \
+            else {"return_hidden_states": True}
 
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if model_config.runner_type == "pooling":
@@ -119,6 +126,9 @@ class Worker(LocalOrDistributedWorkerBase):
                     torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
+
+        # 接收从executor传递的共享内存管理器实例
+        self.shared_memory_manager: SharedMemoryManager = shared_memory_manager
 
     def start_profile(self):
         if self.profiler is None:
@@ -401,6 +411,8 @@ class Worker(LocalOrDistributedWorkerBase):
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_shared_memory_upload=execute_model_req.blocks_to_shared_memory_upload,
+            blocks_to_shared_memory_download=execute_model_req.blocks_to_shared_memory_download,
             virtual_engine=virtual_engine,
             num_steps=num_steps,
         )
@@ -420,6 +432,28 @@ class Worker(LocalOrDistributedWorkerBase):
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
+
+        # 处理共享内存上传
+        if (worker_input.blocks_to_shared_memory_upload is not None
+                and len(worker_input.blocks_to_shared_memory_upload) > 0):
+            # 格式: {request_id: physical_block_mapping}
+            for request_id, physical_block_mapping in worker_input.blocks_to_shared_memory_upload.items():
+                self.copy_block_to_sharememory(
+                    virtual_engine,
+                    request_id,
+                    physical_block_mapping
+                )
+
+        # 处理共享内存下载
+        if (worker_input.blocks_to_shared_memory_download is not None
+                and len(worker_input.blocks_to_shared_memory_download) > 0):
+            # 格式: {request_id: physical_block_mapping}
+            for request_id, physical_block_mapping in worker_input.blocks_to_shared_memory_download.items():
+                self.copy_block_from_sharememory(
+                    virtual_engine,
+                    request_id,
+                    physical_block_mapping
+                )
 
     def _get_cached_seq_group_metadata(
             self,
@@ -518,6 +552,425 @@ class Worker(LocalOrDistributedWorkerBase):
                                                 self.model_config,
                                                 self.parallel_config)
 
+    # 重写execute_model方法，专门处理共享内存操作
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None,
+    ) -> Optional[List[SamplerOutput]]:
+        """
+        执行模型推理，支持共享内存操作的特殊处理
+        
+        当检测到共享内存操作时（空的seq_group_metadata_list但包含共享内存字段），
+        会使用简化的处理流程，避免构建attention metadata导致的错误。
+        对于remote worker，会检查broadcast data来判断是否为共享内存操作。
+        
+        Args:
+            execute_model_req: 模型执行请求，包含序列组元数据和共享内存操作信息
+            
+        Returns:
+            模型输出结果列表，共享内存操作返回空列表
+        """
+        # 检查是否为共享内存操作
+        if (execute_model_req is not None and
+            execute_model_req.seq_group_metadata_list is not None and
+            len(execute_model_req.seq_group_metadata_list) == 0 and
+            (execute_model_req.blocks_to_shared_memory_upload is not None or
+             execute_model_req.blocks_to_shared_memory_download is not None)):
+
+            # 这是一个共享内存操作请求，使用简化的处理流程
+            return self._execute_shared_memory_operation(execute_model_req)
+
+        # 对于remote worker，检查broadcast data是否为共享内存操作
+        if (execute_model_req is None and not self.is_driver_worker and self.do_metadata_broadcast):
+            # Remote worker情况：先查看broadcast data以判断是否为共享内存操作
+            return self._handle_remote_worker_execution()
+
+        # 否则使用默认的execute_model流程
+        return super().execute_model(execute_model_req)
+
+    def _handle_remote_worker_execution(self) -> Optional[List[SamplerOutput]]:
+        """
+        处理remote worker的执行逻辑，确保共享内存操作的正确分发
+        
+        remote worker需要通过broadcast接收driver worker的指令。
+        此方法会检查broadcast data中是否包含共享内存操作，
+        如果是则直接处理，否则重构完整的执行流程。
+        
+        Returns:
+            模型输出结果列表，共享内存操作返回空列表
+        """
+        try:
+            # 接收broadcast data
+            broadcast_data = broadcast_tensor_dict(src=0)
+            if not broadcast_data:
+                return None
+
+            # 检查是否包含共享内存操作
+            has_shared_memory_op = (
+                broadcast_data.get("blocks_to_shared_memory_upload") is not None or
+                broadcast_data.get(
+                    "blocks_to_shared_memory_download") is not None
+            )
+
+            if has_shared_memory_op and broadcast_data.get("num_seq_groups") == 0:
+                # 这是共享内存操作，直接处理worker input
+                worker_input = WorkerInput.from_broadcasted_tensor_dict(
+                    broadcast_data)
+                self.execute_worker(worker_input)
+                return []
+            else:
+                # 这不是共享内存操作，但是我们已经消费了broadcast_data
+                # 我们需要用这个数据重新构建inputs
+                worker_input = WorkerInput.from_broadcasted_tensor_dict(
+                    broadcast_data)
+                model_input = (
+                    self.model_runner.make_model_input_from_broadcasted_tensor_dict(
+                        broadcast_data))
+
+                kwargs = extract_previous_hidden_states(broadcast_data)
+
+                # 执行标准流程
+                self.execute_worker(worker_input)
+
+                if worker_input.num_seq_groups == 0:
+                    return []
+
+                # 执行模型
+                output = self.model_runner.execute_model(
+                    model_input=model_input,
+                    kv_caches=self.kv_cache[worker_input.virtual_engine]
+                    if self.kv_cache is not None else None,
+                    num_steps=worker_input.num_steps,
+                    **kwargs,
+                )
+                return output
+
+        except Exception as e:
+            logger.error(f"Remote worker处理执行时出错: {e}")
+            # 如果出错，回退到默认处理
+            return super().execute_model(None)
+
+    def _execute_shared_memory_operation(
+        self,
+        execute_model_req: ExecuteModelRequest
+    ) -> Optional[List[SamplerOutput]]:
+        """
+        处理共享内存操作，绕过attention metadata构建
+        
+        共享内存操作不需要构建attention metadata，因为没有实际的序列数据处理。
+        driver worker负责广播指令，remote worker接收并执行相应的共享内存操作。
+        
+        Args:
+            execute_model_req: 包含共享内存操作信息的执行请求
+            
+        Returns:
+            空列表，因为共享内存操作不产生模型输出
+        """
+        if self.is_driver_worker:
+            # Driver worker: 准备并广播worker input
+            worker_input = self.prepare_worker_input(execute_model_req)
+
+            if self.do_metadata_broadcast:
+                # 广播完整的worker input数据
+                broadcast_data = worker_input.as_broadcastable_tensor_dict()
+                broadcast_tensor_dict(broadcast_data, src=0)
+        else:
+            # Remote worker: 接收广播的数据并重建worker_input
+            if self.do_metadata_broadcast:
+                broadcast_data = broadcast_tensor_dict(src=0)
+                if not broadcast_data:
+                    return None
+                worker_input = WorkerInput.from_broadcasted_tensor_dict(
+                    broadcast_data)
+            else:
+                # 不应该到达这里，因为共享内存操作需要多worker协作
+                logger.error("共享内存操作需要多worker协作，但do_metadata_broadcast为False")
+                return []
+
+        # 执行worker操作（包括共享内存操作）
+        self.execute_worker(worker_input)
+
+        # 共享内存操作不产生模型输出
+        return []
+
+    # 导出物理块到共享内存
+    def export_physical_blocks_to_shared_memory(
+        self,
+        cache_engine: CacheEngine,
+        block_ids: List[int],
+        request_id: str,
+    ) -> bool:
+        """导出当前worker的物理块数据到manager并直接上传"""
+        if not block_ids:
+            return True
+
+        # 获取tensor并行的rank信息
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        logger.debug(f"Worker rank={tp_rank} 开始导出 {len(block_ids)} 个物理块")
+
+        meta_list = []
+
+        for block_id in block_ids:
+            # 提取当前worker的KV数据
+            layer_blocks = []
+            for layer in cache_engine.gpu_cache:
+                # 每个layer是一个tuple: (k_cache, v_cache)
+                k_cache, v_cache = layer
+                # 提取当前block的数据: [block_size, num_heads, head_size]
+                # [block_size, num_heads, head_size]
+                k_block = k_cache[block_id]
+                # [block_size, num_heads, head_size]
+                v_block = v_cache[block_id]
+
+                # 重新排列为标准格式: [2, block_size, num_heads, head_size]
+                kv_block = torch.stack([k_block, v_block], dim=0)
+                layer_blocks.append(kv_block)
+
+            # 堆叠所有layers: [num_layers, 2, block_size, num_heads, head_size]
+            current_tensor = torch.stack(layer_blocks, dim=0)
+
+            # 转换为numpy用于传输
+            numpy_data = current_tensor.cpu().numpy()
+            worker_data = {
+                "block_id": block_id,
+                "tp_rank": tp_rank,
+                "tp_world_size": tp_world_size,
+                "data": numpy_data,
+                "shape": current_tensor.shape,
+                "dtype": str(numpy_data.dtype),  # 使用numpy的dtype
+                "device": "gpu"
+            }
+
+            # 直接上传碎片到manager
+            success = self.shared_memory_manager.upload_physical_blocks_gpu(
+                request_id, block_id, tp_rank, worker_data)
+
+            if not success:
+                logger.error(
+                    f"Worker rank={tp_rank}: 上传block_id={block_id} 失败")
+                return False
+
+            logger.debug(f"Worker rank={tp_rank}: 成功上传block_id={block_id}")
+
+            # 只有rank_0负责收集meta信息
+            if tp_rank == 0:
+                shm_name = self.shared_memory_manager.get_physical_block_name(
+                    request_id, block_id, 0)
+                meta = {
+                    "block_id": block_id,
+                    "shm_name": shm_name,
+                    "shape": current_tensor.shape,
+                    "dtype": str(numpy_data.dtype),  # 使用numpy的dtype
+                    "nbytes": numpy_data.nbytes,
+                }
+                meta_list.append(meta)
+
+        logger.debug(f"Worker rank={tp_rank} 导出完成，已上传 {len(block_ids)} 个物理块")
+
+        if tp_rank == 0:
+            self.shared_memory_manager.set_physical_blocks_meta(
+                request_id, meta_list, tp_world_size)
+        return True
+
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        if not physical_block_mapping:
+            return False
+
+        for seq_id, block_ids in physical_block_mapping.items():
+            success = self.export_physical_blocks_to_shared_memory(
+                self.cache_engine[virtual_engine],
+                block_ids,
+                request_id=request_id
+            )
+            if not success:
+                logger.error(
+                    f"Worker rank={self.rank}: 导出seq_id={seq_id} 的块失败")
+                return False
+
+        return True
+
+    # 从共享内存导入物理块
+    def import_physical_blocks_from_shared_memory(
+        self,
+        cache_engine: CacheEngine,
+        request_id: str,
+        block_ids: List[int],
+    ) -> bool:
+        if not block_ids:
+            return False
+
+        kv_cache_data = self.shared_memory_manager.load_logical_block(
+            request_id)
+        if kv_cache_data is None:
+            return False
+        meta_list = kv_cache_data.get("physical_blocks_meta")
+        if not meta_list:
+            return False
+
+        try:
+            shared_memories = []
+
+            for idx, meta in enumerate(meta_list):
+                shm = shared_memory.SharedMemory(
+                    name=meta["shm_name"], create=False)
+                shared_memories.append(shm)
+                raw_data = np.frombuffer(
+                    shm.buf, dtype=np.float16).reshape(meta["shape"]).copy()
+                logger.debug(
+                    f"GPU 导入物理块: meta_shape={meta['shape']}, raw_data.shape={raw_data.shape}")
+
+                # 确保使用正确的目标block_id
+                if idx < len(block_ids):
+                    dest_block_id = block_ids[idx]
+                else:
+                    dest_block_id = meta.get("block_id", block_ids[0])
+
+                # 获取tensor并行信息
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_world_size = get_tensor_model_parallel_world_size()
+
+                logger.debug(
+                    f"GPU import: tp_rank={tp_rank}, tp_world_size={tp_world_size}")
+
+                for layer_idx in range(raw_data.shape[0]):
+                    if layer_idx >= len(cache_engine.gpu_cache):
+                        break
+
+                    layer_data = raw_data[layer_idx]  # [2, flat_size]
+
+                    block_size = cache_engine.block_size
+                    num_kv_heads = cache_engine.num_kv_heads
+                    head_size = cache_engine.head_size
+
+                    # 计算当前GPU应该处理的数据范围
+                    # 通用逻辑：适用于单GPU和多GPU情况
+                    # 从flat_size推算total_heads
+                    total_heads = layer_data.shape[1] // (
+                        block_size * head_size)
+                    heads_per_gpu = total_heads // tp_world_size
+
+                    # 计算当前GPU的数据范围
+                    head_start = tp_rank * heads_per_gpu
+                    head_end = head_start + heads_per_gpu
+
+                    # 计算在扁平化数据中的索引范围
+                    flat_start = head_start * block_size * head_size
+                    flat_end = head_end * block_size * head_size
+
+                    # 提取当前GPU的数据部分
+                    # [heads_per_gpu * block_size * head_size]
+                    key_flat = layer_data[0][flat_start:flat_end]
+                    # [heads_per_gpu * block_size * head_size]
+                    value_flat = layer_data[1][flat_start:flat_end]
+
+                    key_flat_tensor = torch.from_numpy(key_flat).to(
+                        device=cache_engine.gpu_cache[layer_idx][0].device,
+                        dtype=torch.float16
+                    )
+                    value_flat_tensor = torch.from_numpy(value_flat).to(
+                        device=cache_engine.gpu_cache[layer_idx][1].device,
+                        dtype=torch.float16
+                    )
+
+                    x = 16 // 2  # fp16 -> x=8
+
+                    # Value处理：使用当前GPU的head数量
+                    value_reshaped = value_flat_tensor.view(
+                        num_kv_heads, head_size, block_size)
+                    value_data = value_reshaped.permute(2, 0, 1)
+
+                    # Key处理：使用当前GPU的head数量
+                    key_temp = key_flat_tensor.view(
+                        num_kv_heads, head_size // x, block_size, x)
+                    key_temp = key_temp.permute(2, 0, 1, 3)
+                    key_data = key_temp.reshape(
+                        block_size, num_kv_heads, head_size)
+
+                    k_cache, v_cache = cache_engine.gpu_cache[layer_idx]
+                    k_cache[dest_block_id] = key_data
+                    v_cache[dest_block_id] = value_data
+
+            return True
+
+        except Exception as e:
+            logger.error(f"导入物理块时出错: {e}")
+            return False
+        finally:
+            for shm in shared_memories:
+                try:
+                    shm.close()
+                except:
+                    pass
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        """
+        从共享内存导入物理块
+        
+        从共享内存读取CPU传来的完整KV缓存数据，
+        根据当前worker的tensor parallel rank切割自己的部分并写入本地缓存。
+        
+        Args:
+            virtual_engine: 虚拟引擎ID
+            request_id: 请求ID
+            physical_block_mapping: 物理块映射 {seq_id: [block_ids]}
+            
+        Returns:
+            是否成功导入所有物理块
+        """
+        # 收集所有需要导入的block_ids
+        all_block_ids = []
+        for seq_id, block_ids in physical_block_mapping.items():
+            all_block_ids.extend(block_ids)
+
+        logger.debug(f"Worker rank={self.rank} 开始导入 {len(all_block_ids)} 个物理块")
+
+        if not all_block_ids:
+            return True
+
+        # 导入所有物理块数据
+        success = self.import_physical_blocks_from_shared_memory(
+            self.cache_engine[virtual_engine], request_id, all_block_ids
+        )
+
+        if success:
+            logger.debug(f"Worker rank={self.rank}: 成功导入 {len(all_block_ids)} 个物理块")
+        else:
+            logger.error(f"Worker rank={self.rank}: 导入物理块失败")
+
+        return success
+
+    def swap_block_gpu_cpu(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> None:
+        _, worker_input, _ = self.prepare_input(
+            execute_model_req=execute_model_req)
+        virtual_engine = worker_input.virtual_engine
+        # Issue cache operations.
+        if (worker_input.blocks_to_swap_in is not None
+                and worker_input.blocks_to_swap_in.numel() > 0):
+            self.cache_engine[virtual_engine].swap_in(
+                worker_input.blocks_to_swap_in)
+        if (worker_input.blocks_to_swap_out is not None
+                and worker_input.blocks_to_swap_out.numel() > 0):
+            self.cache_engine[virtual_engine].swap_out(
+                worker_input.blocks_to_swap_out)
+        if (worker_input.blocks_to_copy is not None
+                and worker_input.blocks_to_copy.numel() > 0):
+            self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

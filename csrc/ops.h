@@ -360,3 +360,69 @@ std::tuple<int64_t, torch::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
+
+void load_weight_and_malloc_active_tensor(
+    torch::Tensor embed_tokens_weight,   // WEIGHT.token_embedding
+    torch::Tensor input_layernorm_weight,   // WEIGHT.rms_att_norm
+    torch::Tensor post_attention_layernorm_weight,   // WEIGHT.rms_ffn_norm
+    torch::Tensor qkv_proj_weight,
+    torch::Tensor o_proj_weight,   // WEIGHT.wo
+    torch::Tensor qkv_proj_bias,
+    torch::Tensor gate_up_proj_weight,
+    torch::Tensor down_proj_weight,   // WEIGHT.ffn_down
+    torch::Tensor norm_weight,  // WEIGHT.output_norm
+    torch::Tensor lm_head_weight       // WEIGHT.output
+);
+
+// qwen3专用的权重加载函数
+void load_weight_and_malloc_active_tensor_qwen3(
+    torch::Tensor embed_tokens_weight,   // WEIGHT.token_embedding
+    torch::Tensor input_layernorm_weight,   // WEIGHT.rms_att_norm
+    torch::Tensor post_attention_layernorm_weight,   // WEIGHT.rms_ffn_norm
+    torch::Tensor qkv_proj_weight,
+    torch::Tensor o_proj_weight,   // WEIGHT.wo
+    torch::Tensor qkv_proj_bias,
+    torch::Tensor gate_up_proj_weight,
+    torch::Tensor down_proj_weight,   // WEIGHT.ffn_down
+    torch::Tensor norm_weight,  // WEIGHT.output_norm
+    torch::Tensor lm_head_weight,      // WEIGHT.output
+    torch::Tensor q_norm_weight,       // WEIGHT.q_norm for qwen3
+    torch::Tensor k_norm_weight        // WEIGHT.k_norm for qwen3
+);
+
+void load_model_config(
+    const std::string& model_type,
+    int64_t head_dim, int64_t hidden_size, int64_t intermediate_size, 
+    int64_t num_attention_heads, int64_t num_hidden_layers, int64_t vocab_size, 
+    int64_t num_key_value_heads, int64_t context_length,
+    double rms_norm_eps, double rope_freq_base, double attn_scale, 
+    int64_t is_neox_style, torch::Tensor const &cos_sin_cache, 
+    int64_t quantization_bit_code
+);
+
+// 统一的权重加载接口
+void load_weight_unified(
+    const std::string& model_type,
+    torch::Tensor embed_tokens_weight, torch::Tensor input_layernorm_weight, 
+    torch::Tensor post_attention_layernorm_weight, torch::Tensor qkv_proj_weight, torch::Tensor o_proj_weight, 
+    torch::Tensor qkv_proj_bias, torch::Tensor gate_up_proj_weight, torch::Tensor down_proj_weight, 
+    torch::Tensor norm_weight, torch::Tensor lm_head_weight,
+    torch::Tensor q_norm_weight,
+    torch::Tensor k_norm_weight
+);
+
+void get_next_token_for_torch(
+    torch::Tensor model_output,   // WEIGHT.token_embedding
+    torch::Tensor hidden_stats,
+
+    bool is_prompt,
+    torch::Tensor block_tables,
+    torch::Tensor seq_lens,
+    torch::Tensor& slot_mapping,
+    torch::Tensor positions,
+    std::vector<torch::Tensor> kv_caches,
+    int64_t block_size,
+    int64_t N_tokens,
+    bool is_qkv_bias,
+    bool is_qk_norm
+);

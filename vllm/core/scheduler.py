@@ -19,8 +19,9 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupBase, SequenceGroupMetadata,
                            SequenceGroupMetadataDelta, SequenceStage,
-                           SequenceStatus)
+                           SequenceStatus, SequenceStage)
 from vllm.utils import Device, PyObjectCache
+from vllm.core.shared_memory import SharedMemoryManager
 
 logger = init_logger(__name__)
 
@@ -432,6 +433,7 @@ class Scheduler:
         lora_config: Optional[LoRAConfig],
         pipeline_parallel_size: int = 1,
         output_proc_callback: Optional[Callable] = None,
+        shared_memory_manager: Optional[SharedMemoryManager] = None
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -439,6 +441,11 @@ class Scheduler:
         # simple and NOT fair. It can lead to starvation of some
         # LoRAs. This should be improved in the future.
         self.lora_config = lora_config
+        # 保存共享内存管理器引用
+        self.shared_memory_manager: Optional[SharedMemoryManager] = shared_memory_manager
+        self.device = "gpu"
+        if cache_config.num_cpu_blocks == 0:
+            self.device = "cpu"
 
         version = "selfattn"
         if (self.scheduler_config.runner_type == "pooling"
@@ -551,6 +558,18 @@ class Scheduler:
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         # Add sequence groups to the waiting queue.
+
+        # 检查PD分离请求是否在未启用自动PD卸载时被接收
+        if self.shared_memory_manager is None:
+            sampling_params = seq_group.sampling_params
+            if (sampling_params is not None and
+                (sampling_params.request_id_inference is not None or
+                 sampling_params.num_decode_tokens is not None)):
+                raise ValueError(
+                    "PD分离请求被拒绝：未启用自动PD卸载功能。"
+                    "请使用 --enable-auto-pd-offload 参数启动服务。"
+                )
+
         self.waiting.append(seq_group)
 
     def _add_seq_group_to_running(self, seq_group: SequenceGroup) -> None:
@@ -632,6 +651,41 @@ class Scheduler:
         return (len(self.waiting) != 0 or len(self.running) != 0
                 or len(self.swapped) != 0)
 
+    def has_unfinished_seqs_for_sysHAX(self) -> bool:
+        """
+        判断是否还有未完成的请求需要继续处理。
+
+        对于GPU/CPU混合部署方案，需要考虑以下情况：
+        1. running队列中有待执行的decode任务
+        2. swapped队列中有待交换回来的任务
+        3. waiting队列中有未处理的任务，包括两种情况：
+           a. 原生vLLM任务（request_id_inference为None且num_decode_tokens为None）
+           b. 接力decode任务（request_id_inference不为None的任务）
+           c. PD分离任务（request_id_inference为None但num_decode_tokens不为None）
+
+        Returns:
+            bool: 如果有任何未完成任务返回True，否则返回False
+        """
+        # 检查running和swapped队列
+        if len(self.running) != 0 or len(self.swapped) != 0:
+            return True
+
+        # 检查waiting队列中是否有需要处理的任务
+        for seq_group in self.waiting:
+            sp = seq_group.sampling_params
+            # 原生vLLM逻辑：无 sampling_params 或 request_id_inference 和 num_decode_tokens 都为 None
+            if sp is None or (sp.request_id_inference is None and sp.num_decode_tokens is None):
+                return True
+            # 接力decode任务：sampling_params 存在且 request_id_inference 不为 None
+            if sp is not None and sp.request_id_inference is not None:
+                return True
+            # PD 分离任务：sampling_params 存在，request_id_inference 为 None 且 num_decode_tokens 不为 None
+            if sp is not None and sp.request_id_inference is None and sp.num_decode_tokens is not None:
+                return True
+
+        # 所有任务都已处理完毕
+        return False
+
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
 
@@ -711,12 +765,12 @@ class Scheduler:
             #      irrelevant.
             num_uncached_new_tokens, _ = \
                 self._get_num_new_uncached_and_cached_tokens(
-                seq_group,
-                SequenceStatus.RUNNING,
-                enable_chunking,
-                budget,
-                partial_prefill_metadata,
-            )
+                    seq_group,
+                    SequenceStatus.RUNNING,
+                    enable_chunking,
+                    budget,
+                    partial_prefill_metadata,
+                )
 
             num_running_tokens = num_uncached_new_tokens
             if num_running_tokens == 0:
@@ -991,7 +1045,7 @@ class Scheduler:
             num_new_seqs = seq_group.get_max_num_running_seqs()
             num_new_tokens_uncached, _ = \
                 self._get_num_new_uncached_and_cached_tokens(
-                seq_group, SequenceStatus.WAITING, False, budget)
+                    seq_group, SequenceStatus.WAITING, False, budget)
 
             # Only preempt if priority inversion exists
             while running_queue and self._get_priority(
@@ -1320,7 +1374,7 @@ class Scheduler:
                 indices_ignored = list[int]()
                 for i, schedule_seq_group in enumerate(scheduled_seq_groups):
                     if using_prompt_embeds !=\
-                        schedule_seq_group.seq_group.uses_prompt_embeds():
+                            schedule_seq_group.seq_group.uses_prompt_embeds():
                         ignored_seq_groups_for_embeds.append(
                             schedule_seq_group.seq_group)
                         indices_ignored.append(i)
@@ -1531,6 +1585,11 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
+        if self.shared_memory_manager is not None:
+            self._seq_load_kvcache()
+            self._seq_preprocessing_queue()
+            self._prioritize_pd_prefill()
+
         scheduler_outputs: SchedulerOutputs = self._schedule()
         now = time.time()
 
@@ -1716,6 +1775,24 @@ class Scheduler:
 
         self.running = remaining
 
+        # AUTO_PD_OFFLOAD: 处理swapped队列中的已完成序列
+        if self.shared_memory_manager is not None:
+            swapped_remaining: Deque[SequenceGroup] = deque()
+            for seq_group in self.swapped:
+                self._free_finished_seq_group(seq_group)
+                if not seq_group.is_finished():
+                    swapped_remaining.append(seq_group)
+                else:
+                    # 清理AUTO_PD_OFFLOAD相关的映射数据
+                    if hasattr(seq_group, 'auto_pd_offload_mapping'):
+                        delattr(seq_group, 'auto_pd_offload_mapping')
+                    # 清理处理标记
+                    if hasattr(seq_group, '_auto_pd_offload_processed'):
+                        delattr(seq_group, '_auto_pd_offload_processed')
+                    logger.debug(f"AUTO_PD_OFFLOAD: 序列组 {seq_group.request_id} 已从swapped队列中完成并清理")
+
+            self.swapped = swapped_remaining
+
         # Handle async stopped sequence groups
         # (ones that reached max model len)
         if self._async_stopped:
@@ -1835,6 +1912,31 @@ class Scheduler:
         seq_group: SequenceGroup,
         blocks_to_swap_out: List[Tuple[int, int]],
     ) -> None:
+        # AUTO_PD_OFFLOAD: 在swap out之前处理KV cache上传
+        if self.shared_memory_manager is not None:
+
+            try:
+                # 获取物理块映射（在swap out之前）
+                kv_cache_mapping = {}
+                running_seqs = seq_group.get_seqs(
+                    status=SequenceStatus.RUNNING)
+
+                for seq in running_seqs:
+                    if seq.seq_id in self.block_manager.block_tables:
+                        block_table = self.block_manager.block_tables[seq.seq_id]
+                        physical_block_ids = block_table.physical_block_ids
+                        if physical_block_ids:
+                            kv_cache_mapping[seq.seq_id] = physical_block_ids.copy(
+                            )
+
+                if kv_cache_mapping:
+                    # 存储物理块映射到序列组，供后续使用
+                    seq_group.auto_pd_offload_mapping = kv_cache_mapping
+                    logger.info("\033[0;32m" + f"AUTO_PD_OFFLOAD: 为序列组 {seq_group.request_id} 预存储物理块映射" + "\033[0m")
+
+            except Exception as e:
+                logger.error(f"AUTO_PD_OFFLOAD预处理失败: {e}")
+
         self._swap_out(seq_group, blocks_to_swap_out)
 
     def _swap_in(
@@ -2091,3 +2193,169 @@ class Scheduler:
                              prefill_slot_budget)
 
         return num_new_tokens
+
+    def store_kv_cache(self, seq_group: SequenceGroup, cpu_mapping: Dict[int, list[int]]) -> Dict[int, List[int]]:
+        assert self.shared_memory_manager is not None, "shared_memory_manager is None"
+
+        request_id = seq_group.request_id
+        if not cpu_mapping:
+            logger.warning(f"Warning, {request_id} 无有效块表，KV 缓存保存失败")
+            return {}
+
+        kv_cache_data = {
+            "physical_block_id_mapping": cpu_mapping,
+            "device": self.device,
+            "physical_blocks_meta": None,
+            "output_token_ids": None,
+        }
+        if self.shared_memory_manager.store_logical_block(request_id, kv_cache_data):
+            logger.debug(f"KV 缓存已存入共享内存 - request_id: {request_id}")
+            return cpu_mapping
+        else:
+            logger.warning(f"KV 缓存存入失败 - request_id: {request_id}")
+            return {}
+
+    def load_kv_cache(self, seq_group: SequenceGroup) -> Dict[int, List[int]]:
+        assert self.shared_memory_manager is not None, "shared_memory_manager is None"
+
+        request_id = seq_group.request_id
+        request_id_inference = seq_group.sampling_params.request_id_inference
+        logger.debug(f"开始准备加载KV缓存逻辑块 - 本次id: {request_id}, 继承id: {request_id_inference}")
+
+        # 仅对带有继承 id 的 decode 任务进行接力加载
+        if request_id_inference is not None:
+            kv_cache_data = self.shared_memory_manager.load_logical_block(
+                request_id_inference)
+
+            if kv_cache_data is not None:
+                raw_mapping = kv_cache_data.get(
+                    "physical_block_id_mapping", {})
+                int_mapping: Dict[int, List[int]] = {
+                    int(k): list(v) for k, v in raw_mapping.items()}
+
+                self.block_manager.allocate(seq_group=seq_group)
+                seqs = seq_group.get_seqs()
+                assert len(int_mapping) == len(
+                    seqs), f"读取序列数量 {len(int_mapping)} != 当前序列数量 {len(seqs)}"
+
+                sorted_keys = sorted(int_mapping.keys())
+                raw_output_ids = kv_cache_data.get("output_token_ids") or {}
+                int_output_ids: Dict[int, List[int]] = {
+                    int(k): v for k, v in raw_output_ids.items()}
+                block_mapping: Dict[int, List[int]] = {}
+
+                # 获取上一次保存时的设备类型
+                prev_device = kv_cache_data.get("device")
+                current_device = self.device
+
+                for idx, seq in enumerate(seqs):
+                    old_key = sorted_keys[idx]
+                    ids = int_mapping[old_key]
+                    tbl = self.block_manager.block_tables[seq.seq_id]
+                    inherited_tokens = int_output_ids.get(old_key, [])
+
+                    if prev_device == current_device:
+                        # 同设备接力（GPU->GPU 或 CPU->CPU）：直接覆盖底层块ID列表
+                        tbl._blocks._block_ids = ids.copy()
+                        block_mapping[seq.seq_id] = tbl.physical_block_ids.copy()
+                        seq.data.output_token_ids = inherited_tokens
+                        logger.debug(f"同设备接力 {prev_device}->{current_device}: 覆盖块ID列表")
+                        
+                    else:
+                        # 不同设备接力（GPU->CPU 或 CPU->GPU）：追加槽位
+                        if len(inherited_tokens) > 0:
+                            self.block_manager.append_slots(
+                                seq, len(inherited_tokens))
+                        block_mapping[seq.seq_id] = tbl.physical_block_ids.copy()
+
+                        original_prompt_len = len(seq.data.prompt_token_ids)
+                        seq.data.output_token_ids = inherited_tokens
+                        total_tokens = original_prompt_len + \
+                            len(inherited_tokens)
+                        seq.data.update_num_computed_tokens(total_tokens - 1)
+                        logger.debug(f"不同设备接力 {prev_device}->{current_device}: 追加槽位 {len(inherited_tokens)} 个token")
+                return block_mapping
+
+    def _seq_preprocessing_queue(self) -> None:
+        """
+        从 waiting 队列中提取带有 request_id_inference 的 decode 任务，并将其移入 running 队列。
+        """
+        waiting_queue = self.waiting
+        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+
+        # waiting队列的任务会进行如下判断
+        # * 带有request_id_inference的任务为动态调度任务的decode阶段，不执行prefill，直接进入decode
+        while waiting_queue:
+            seq_group = waiting_queue[0]
+            waiting_queue.popleft()
+            sp = seq_group.sampling_params
+            if sp is not None and sp.request_id_inference is not None:
+                logger.info(
+                    "\033[0;32m" + f"发现decode接力任务: request_id={seq_group.request_id}" + "\033[0m")
+                self.running.append(seq_group)
+                for seq in seq_group.get_seqs():
+                    seq.status = SequenceStatus.RUNNING
+                    seq.data._stage = SequenceStage.DECODE
+            else:
+                leftover_waiting_sequences.appendleft(seq_group)
+        waiting_queue.extendleft(leftover_waiting_sequences)
+
+    def _prioritize_pd_prefill(self) -> None:
+        """
+        从 waiting 队列中提取带有 num_decode_tokens 且无 request_id_inference 的 prefill 任务，移动到 waiting 队列头部优先处理
+        """
+        for sg in list(self.waiting):
+            sp = sg.sampling_params
+            # PD 分离 prefill: sampling_params 存在，num_decode_tokens 不为 None 且 request_id_inference 为 None
+            if sp is not None and sp.num_decode_tokens is not None and sp.request_id_inference is None:
+                self.waiting.remove(sg)
+                self.waiting.appendleft(sg)
+
+    def _seq_load_kvcache(self) -> None:
+        """
+        对动态调度的任务保存kvcache
+        该动作发生在：
+            1. decode开始前读取kvcache
+        """
+        failed_kv_cache_load_requests: List[SequenceGroup] = [
+        ]  # 存储加载KV缓存失败的请求
+        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+
+        waiting_queue = self.waiting
+        assert len(self._async_stopped) == 0
+        while waiting_queue:
+            seq_group = waiting_queue[0]
+            waiting_queue.popleft()
+
+            # 处理需要共享内存KV缓存的 decode 任务
+            sp = seq_group.sampling_params
+            if sp is not None and sp.request_id_inference is not None:
+                # 尝试从共享内存加载KV缓存
+                seq_group.physical_block_mapping = self.load_kv_cache(
+                    seq_group)
+                if len(seq_group.physical_block_mapping) == 0:
+                    request_id = seq_group.request_id
+                    request_id_inference = seq_group.sampling_params.request_id_inference
+                    logger.warning(
+                        f"Failed to load KV cache for request {request_id} from {request_id_inference}")
+
+                    # 将该任务添加到失败列表
+                    failed_kv_cache_load_requests.append(seq_group)
+                    continue
+            leftover_waiting_sequences.appendleft(seq_group)
+        waiting_queue.extendleft(leftover_waiting_sequences)
+
+        # 处理加载KV缓存失败的请求
+        for seq_group in failed_kv_cache_load_requests:
+            # 对于加载KV缓存失败的请求，sampling_params 不为 None 时重置其 request_id_inference，将其作为普通请求处理
+            if seq_group.sampling_params is not None:
+                seq_group.sampling_params.request_id_inference = None
+            logger.info(
+                f"重置请求 {seq_group.request_id} 的request_id_inference为None，将作为普通请求处理")
+            # 将请求放回waiting队列，但此时它将作为普通prefill请求处理
+            if seq_group.sampling_params is not None:
+                seq_group.sampling_params.num_decode_tokens = None
+                seq_group.sampling_params.request_id_inference = None
+            for seq in seq_group.get_seqs():
+                seq.status = SequenceStatus.WAITING
+            self.waiting.appendleft(seq_group)

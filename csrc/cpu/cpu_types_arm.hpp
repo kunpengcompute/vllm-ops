@@ -6,6 +6,10 @@
   #include "omp.h"
 #endif
 
+typedef float16_t f16;
+extern float f16_to_f32(f16 h);
+extern f16 f32_to_f16(float h);
+
 namespace vec_op {
 
 #ifdef ARM_BF16_SUPPORT
@@ -71,7 +75,14 @@ struct FP16Vec8 : public Vec<FP16Vec8> {
 struct FP16Vec16 : public Vec<FP16Vec16> {
   constexpr static int VEC_ELEM_NUM = 16;
 
-  float16x8x2_t reg;
+    union {
+      float16x8x2_t reg;
+      f16 s[VEC_ELEM_NUM];
+    };
+
+    explicit FP16Vec16() {
+        reg.val[0] = reg.val[1] = vdupq_n_f16(0.0f);
+    }
 
   explicit FP16Vec16(const void* ptr) {
     reg.val[0] = vld1q_f16(reinterpret_cast<const __fp16*>(ptr));
@@ -79,6 +90,10 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
   }
 
   explicit FP16Vec16(const FP32Vec16& vec);
+
+  explicit FP16Vec16(const FP16Vec8& vec) {
+      reg.val[0] = reg.val[1] = vec.reg;
+  }
 
   void save(void* ptr) const {
     vst1q_f16(reinterpret_cast<__fp16*>(ptr), reg.val[0]);
@@ -158,6 +173,25 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
           break;
       }
     }
+  }
+  f16 reduce_sum() const {
+    float16x8_t sum = vaddq_f16(reg.val[0], reg.val[1]);
+    float32x4_t t0 = vcvt_f32_f16(vget_low_f16(sum));
+    float32x4_t t1 = vcvt_f32_f16(vget_high_f16(sum));
+    return f32_to_f16(vaddvq_f32(vaddq_f32(t0, t1)));
+  }
+
+  template <int group_size>
+  float reduce_sub_sum(int idx) {
+    f16 sum = 0.0;
+    constexpr uint32_t base_mask = (0xFFFF >> (16 - group_size));
+    uint32_t mask = base_mask << (idx * group_size);
+    unroll_loop<int, 16>([&sum, &mask, this](int i){
+      int flag = mask & 0x1;
+      mask = mask >> 1;
+      if (flag != 0) sum += s[i];
+    });
+    return sum;
   }
 };
 
@@ -553,6 +587,11 @@ inline void fma(FP32Vec16& acc, FP32Vec16& a, FP32Vec16& b) {
   acc.reg.val[2] = vfmaq_f32(acc.reg.val[2], a.reg.val[2], b.reg.val[2]);
   acc.reg.val[3] = vfmaq_f32(acc.reg.val[3], a.reg.val[3], b.reg.val[3]);
 };
+
+inline void fma(FP16Vec16 &acc, FP16Vec16 &a, FP16Vec16 &b) {
+  acc.reg.val[0] = vfmaq_f16(acc.reg.val[0], a.reg.val[0], b.reg.val[0]);
+  acc.reg.val[1] = vfmaq_f16(acc.reg.val[1], a.reg.val[1], b.reg.val[1]);
+}
 
 #ifdef ARM_BF16_SUPPORT
 inline void fma(FP32Vec16& acc, BF16Vec32& a, BF16Vec32& b) {

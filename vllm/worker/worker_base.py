@@ -130,6 +130,28 @@ class WorkerBase:
         """Get vocabulary size from model configuration."""
         return self.model_config.get_vocab_size()
 
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        return self.worker.copy_block_to_sharememory(virtual_engine, request_id, physical_block_mapping)
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        return self.worker.copy_block_from_sharememory(virtual_engine, request_id, physical_block_mapping)
+
+    def swap_block_gpu_cpu(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> None:
+        return self.worker.swap_block_gpu_cpu(execute_model_req)
+
 
 class DelegateWorkerBase(WorkerBase):
     """
@@ -219,6 +241,10 @@ class WorkerInput:
     blocks_to_swap_in: Optional[torch.Tensor] = None
     blocks_to_swap_out: Optional[torch.Tensor] = None
     blocks_to_copy: Optional[torch.Tensor] = None
+    blocks_to_shared_memory_upload: Optional[Dict[str,
+                                                  Dict[int, List[int]]]] = None
+    blocks_to_shared_memory_download: Optional[Dict[str,
+                                                    Dict[int, List[int]]]] = None
     virtual_engine: int = 0
     num_steps: int = 1
 
@@ -236,8 +262,12 @@ class WorkerInput:
             blocks_to_swap_in=tensor_dict.pop("blocks_to_swap_in"),
             blocks_to_swap_out=tensor_dict.pop("blocks_to_swap_out"),
             blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
+            blocks_to_shared_memory_upload=tensor_dict.pop(
+                "blocks_to_shared_memory_upload", None),
+            blocks_to_shared_memory_download=tensor_dict.pop(
+                "blocks_to_shared_memory_download", None),
             virtual_engine=tensor_dict["virtual_engine"],
-            num_steps=tensor_dict.pop("num_steps"),
+            num_steps=tensor_dict.pop("num_steps")
         )
 
     def as_broadcastable_tensor_dict(
@@ -250,8 +280,10 @@ class WorkerInput:
             "blocks_to_swap_in": self.blocks_to_swap_in,
             "blocks_to_swap_out": self.blocks_to_swap_out,
             "blocks_to_copy": self.blocks_to_copy,
+            "blocks_to_shared_memory_upload": self.blocks_to_shared_memory_upload,
+            "blocks_to_shared_memory_download": self.blocks_to_shared_memory_download,
             "virtual_engine": self.virtual_engine,
-            "num_steps": self.num_steps,
+            "num_steps": self.num_steps
         }
 
         return tensor_dict
@@ -497,6 +529,7 @@ class WorkerWrapperBase:
         self,
         vllm_config: VllmConfig,
         rpc_rank: int = 0,
+        shared_memory_manager=None,
     ) -> None:
         """
         Initialize the worker wrapper with the given vllm_config and rpc_rank.
@@ -509,6 +542,8 @@ class WorkerWrapperBase:
         group.
         """
         self.rpc_rank = rpc_rank
+        # Store shared memory manager for KV cache operations
+        self.shared_memory_manager = shared_memory_manager
         self.worker: Optional[WorkerBase] = None
         # do not store this `vllm_config`, `init_worker` will set the final
         # one. TODO: investigate if we can remove this field in
@@ -547,6 +582,7 @@ class WorkerWrapperBase:
         Arguments are passed to the worker class constructor.
         """
         kwargs = all_kwargs[self.rpc_rank]
+        kwargs.setdefault('shared_memory_manager', self.shared_memory_manager)
         self.vllm_config = kwargs.get("vllm_config", None)
         assert self.vllm_config is not None, (
             "vllm_config is required to initialize the worker")

@@ -67,10 +67,15 @@ class SequenceStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = 4
     FINISHED_ABORTED = 5
     FINISHED_IGNORED = 6
+    SCHEDULED = 7
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
         return status > SequenceStatus.SWAPPED
+
+    @staticmethod
+    def is_scheduled(status: "SequenceStatus") -> bool:
+        return status == SequenceStatus.SCHEDULED
 
     @staticmethod
     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
@@ -85,6 +90,8 @@ class SequenceStatus(enum.IntEnum):
             # are longer than the model's length cap. Therefore, the stop
             # reason should also be "length" as in OpenAI API.
             finish_reason = "length"
+        elif status == SequenceStatus.SCHEDULED:
+            finish_reason = "scheduled"
         else:
             finish_reason = None
         return finish_reason
@@ -504,6 +511,7 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[list[str]] = None
+        self.scheduled_finished = False
 
     @property
     def n_blocks(self) -> int:
@@ -659,6 +667,9 @@ class Sequence:
     def is_finished(self) -> bool:
         return SequenceStatus.is_finished(self.status)
 
+    def is_scheduled(self) -> bool:
+        return SequenceStatus.is_scheduled(self.status)
+
     def fork(self, new_seq_id: int) -> "Sequence":
         new_seq = copy.deepcopy(self)
         new_seq.seq_id = new_seq_id
@@ -763,6 +774,10 @@ class SequenceGroup:
         self.priority = priority
 
         self.cached_request_output = None
+        # 用于存储需要在worker端导出的物理块映射信息
+        self.physical_block_mapping: Optional[dict[int, list[int]]] = None
+        # 标记是否已从共享内存加载过 prefill KV 缓存
+        self.is_load_prefill_kvcache = False
 
     @property
     def prompt(self) -> Optional[str]:
@@ -955,6 +970,9 @@ class SequenceGroup:
 
     def is_prefill(self) -> bool:
         return self.first_seq.is_prefill()
+
+    def is_scheduled(self) -> bool:
+        return self.first_seq.is_scheduled()
 
     def __repr__(self) -> str:
         return (f"SequenceGroup(request_id={self.request_id}, "
@@ -1380,6 +1398,12 @@ class ExecuteModelRequest(
                                    int]] = msgspec.field(default_factory=list)
     # Blocks to copy. Source to dest block.
     blocks_to_copy: list[tuple[int, int]] = msgspec.field(default_factory=list)
+    # Blocks to upload to shared memory. Dict of request_id -> block_mapping.
+    blocks_to_shared_memory_upload: Optional[dict[str,
+                                                  dict[int, list[int]]]] = None
+    # Blocks to download from shared memory. Dict of request_id -> block_mapping.
+    blocks_to_shared_memory_download: Optional[dict[str,
+                                                    dict[int, list[int]]]] = None
     # Virtual engine ID for pipeline parallel.
     virtual_engine: int = 0
     # The number of slots for lookahead decoding.
@@ -1444,7 +1468,8 @@ class ExecuteModelRequest(
             finished_requests_ids=self.finished_requests_ids,
             last_sampled_token_ids=self.last_sampled_token_ids.clone()
             if self.last_sampled_token_ids is not None else None,
-            async_callback=self.async_callback)
+            async_callback=self.async_callback,
+            physical_block_mapping=self.physical_block_mapping)
 
 
 @dataclass

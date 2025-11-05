@@ -291,7 +291,14 @@ class BlockList:
         return self._blocks
 
     def ids(self) -> List[int]:
-        return self._block_ids
+        # 对block_ids进行去重，保持原有顺序
+        seen = set()
+        result = []
+        for block_id in self._block_ids:
+            if block_id not in seen:
+                seen.add(block_id)
+                result.append(block_id)
+        return result
 
 
 @dataclass

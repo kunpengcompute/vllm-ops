@@ -200,6 +200,10 @@ class SamplingParams(
         extra_args: Arbitrary additional args, that can be used by custom
             sampling implementations. Not used by any in-tree sampling
             implementations.
+        request_id_inference: Read the block of this request to continue the inference. 
+            Defaults to None. 
+        num_decode_tokens: The number of tokens to generate in each step
+            during decoding. Defaults to None.
     """
 
     n: int = 1
@@ -248,6 +252,9 @@ class SamplingParams(
     bad_words: Optional[list[str]] = None
     _bad_words_token_ids: Optional[list[list[int]]] = None
 
+    request_id_inference: Optional[str] = None
+    num_decode_tokens: Optional[int] = None
+
     @staticmethod
     def from_optional(
         n: Optional[int] = 1,
@@ -280,6 +287,8 @@ class SamplingParams(
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
+        request_id_inference: Optional[str] = None,
+        num_decode_tokens: Optional[int] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -322,6 +331,8 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            request_id_inference=request_id_inference,
+            num_decode_tokens=num_decode_tokens,
         )
 
     def __post_init__(self) -> None:
@@ -581,11 +592,13 @@ class SamplingParams(
             f"logprobs={self.logprobs}, "
             f"prompt_logprobs={self.prompt_logprobs}, "
             f"skip_special_tokens={self.skip_special_tokens}, "
-            "spaces_between_special_tokens="
-            f"{self.spaces_between_special_tokens}, "
+            f"spaces_between_special_tokens={self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
             f"guided_decoding={self.guided_decoding}, "
-            f"extra_args={self.extra_args})")
+            f"extra_args={self.extra_args}, "
+            f"request_id_inference={self.request_id_inference}, "
+            f"num_decode_tokens={self.num_decode_tokens})"
+        )
 
 
 class BeamSearchParams(

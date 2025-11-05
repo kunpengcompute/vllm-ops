@@ -80,9 +80,9 @@ else()
     find_isa(${CPUINFO} "POWER9" POWER9_FOUND)
     find_isa(${CPUINFO} "asimd" ASIMD_FOUND) # Check for ARM NEON support
     find_isa(${CPUINFO} "bf16" ARM_BF16_FOUND) # Check for ARM BF16 support
+    find_isa(${CPUINFO} "i8mm" ARM_I8MM_FOUND) # Check for ARM I8MM support
     find_isa(${CPUINFO} "S390" S390_FOUND)
 endif()
-
 
 if (AVX512_FOUND AND NOT AVX512_DISABLED)
     list(APPEND CXX_COMPILE_FLAGS
@@ -123,18 +123,30 @@ elseif (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
 
 elseif (ASIMD_FOUND)
     message(STATUS "ARMv8 or later architecture detected")
-    if(ARM_BF16_FOUND)
+    if(ARM_BF16_FOUND AND ARM_I8MM_FOUND)
+        message(STATUS "BF16 and I8MM extension detected")
+        set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16+i8mm")
+        add_compile_definitions(ARM_BF16_SUPPORT)
+        add_compile_definitions(ARM_I8MM_SUPPORT)
+        add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+    elseif(ARM_BF16_FOUND)
         message(STATUS "BF16 extension detected")
         set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16")
         add_compile_definitions(ARM_BF16_SUPPORT)
+    elseif(ARM_I8MM_FOUND)
+        message(STATUS "I8MM extension detected")
+        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16+i8mm")
+        add_compile_definitions(ARM_I8MM_SUPPORT)
+        add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
     else()
-        message(WARNING "BF16 functionality is not available")
-        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16")  
+        message(WARNING "BF16 and I8MM functionality is not available")
+        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16") 
     endif()
-    list(APPEND CXX_COMPILE_FLAGS ${MARCH_FLAGS})     
-elseif(APPLE_SILICON_FOUND)
-    message(STATUS "Apple Silicon Detected")
-    set(ENABLE_NUMA OFF)
+    list(APPEND CXX_COMPILE_FLAGS ${MARCH_FLAGS} "-fpermissive"
+        "-O3" "-funroll-loops" "-fomit-frame-pointer"
+        "-ffast-math" "-finline-functions" "-fno-math-errno"
+        "-flto" "-ftree-vectorize" "-funsafe-math-optimizations"
+        "-falign-functions=16" "-falign-loops=16" "-fno-unwind-tables")
 elseif (S390_FOUND)
     message(STATUS "S390 detected")
     # Check for S390 VXE support
@@ -224,7 +236,10 @@ set(VLLM_EXT_SRC
     "csrc/cpu/layernorm.cpp"
     "csrc/cpu/mla_decode.cpp"
     "csrc/cpu/pos_encoding.cpp"
-    "csrc/cpu/torch_bindings.cpp")
+    "csrc/cpu/sysHAX_ops.cpp"
+    "csrc/cpu/torch_bindings.cpp"
+    "csrc/cpu/quantize.cpp"
+    "csrc/cpu/cpu_utils.cpp")
 
 if (AVX512_FOUND AND NOT AVX512_DISABLED)
     set(VLLM_EXT_SRC

@@ -443,6 +443,10 @@ class EngineArgs:
     enable_multimodal_encoder_data_parallel: bool = \
         ParallelConfig.enable_multimodal_encoder_data_parallel
 
+    # Additional parameters for custom features
+    use_greedy: bool = True
+    enable_auto_pd_offload: bool = False
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -885,6 +889,24 @@ class EngineArgs:
                             action='store_true',
                             help='Disable logging statistics.')
 
+        parser.add_argument(
+            '--use-greedy',
+            action='store_true',
+            default=True,
+            help='Whether to enable greedy mode in CPU mode (sets temperature to 0.0 by default). Accepts true or false'
+        )
+
+        parser.add_argument(
+            '--enable-auto-pd-offload',
+            action='store_true',
+            default=False,
+            help='Enable shared memory initialization for dual-instance (GPU & CPU) '
+                 'PD separation. When enabled, the GPU instance will automatically '
+                 'upload KV cache to shared memory instead of swapping to CPU memory '
+                 'when swapout is triggered, allowing the CPU instance to take over '
+                 'and continue decoding.'
+        )
+
         return parser
 
     @classmethod
@@ -1238,6 +1260,7 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            enable_auto_pd_offload=self.enable_auto_pd_offload,
         )
 
         return config

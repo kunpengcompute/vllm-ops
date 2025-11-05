@@ -129,6 +129,43 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kCPU, &rotary_embedding);
 
+  ops.def(
+      "load_weight_and_malloc_active_tensor("
+          "Tensor embed_tokens_weight, Tensor input_layernorm_weight, Tensor post_attention_layernorm_weight,"
+          "Tensor qkv_proj_weight, Tensor o_proj_weight, Tensor qkv_proj_bias, Tensor gate_up_proj_weight,"
+          "Tensor down_proj_weight, Tensor norm_weight, Tensor lm_head_weight) -> ()");
+  ops.impl("load_weight_and_malloc_active_tensor", torch::kCPU, &load_weight_and_malloc_active_tensor);
+
+  // qwen3专用的权重加载函数绑定
+  ops.def(
+      "load_weight_and_malloc_active_tensor_qwen3("
+          "Tensor embed_tokens_weight, Tensor input_layernorm_weight, Tensor post_attention_layernorm_weight,"
+          "Tensor qkv_proj_weight, Tensor o_proj_weight, Tensor qkv_proj_bias, Tensor gate_up_proj_weight,"
+          "Tensor down_proj_weight, Tensor norm_weight, Tensor lm_head_weight, Tensor q_norm_weight, Tensor k_norm_weight) -> ()");
+  ops.impl("load_weight_and_malloc_active_tensor_qwen3", torch::kCPU, &load_weight_and_malloc_active_tensor_qwen3);
+
+  // 统一的权重加载接口绑定
+  ops.def(
+      "load_weight_unified("
+          "str model_type,"
+          "Tensor embed_tokens_weight, Tensor input_layernorm_weight, Tensor post_attention_layernorm_weight,"
+          "Tensor qkv_proj_weight, Tensor o_proj_weight, Tensor qkv_proj_bias, Tensor gate_up_proj_weight,"
+          "Tensor down_proj_weight, Tensor norm_weight, Tensor lm_head_weight, Tensor q_norm_weight, Tensor k_norm_weight) -> ()");
+  ops.impl("load_weight_unified", torch::kCPU, &load_weight_unified);
+
+  ops.def(
+      "load_model_config("
+          "str model_type, int head_dim, int hidden_size, int intermediate_size, int num_attention_heads, int num_hidden_layers, int vocab_size, int num_key_value_heads, int context_length,"
+          "float rms_norm_eps, float rope_freq_base, float attn_scale, int is_neox_style, Tensor cos_sin_cache, int quantization_bit_code) -> ()");
+  ops.impl("load_model_config", torch::kCPU, &load_model_config);
+
+  ops.def(
+        "get_next_token_for_torch("
+            "Tensor model_output, Tensor hidden_stats, bool is_prompt, "
+            "Tensor block_tables, Tensor seq_lens, Tensor slot_mapping, Tensor positions, Tensor[]! kv_caches, int block_size,"
+            "int N_tokens, bool is_qkv_bias, bool is_qk_norm) -> ()");
+  ops.impl("get_next_token_for_torch", torch::kCPU, &get_next_token_for_torch);
+
   // Quantization
 #ifdef __AVX512F__
   // Compute int8 quantized tensor for given scaling factor.

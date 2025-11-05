@@ -409,7 +409,7 @@ class _AsyncLLMEngine(LLMEngine):
             # Multi-step case
             return ctx.request_outputs
 
-        if not self.has_unfinished_requests():
+        if not self.has_unfinished_seqs_for_sysHAX():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
                 self._process_model_outputs(ctx=ctx)

@@ -274,6 +274,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     allowed_token_ids: Optional[list[int]] = None
     # --8<-- [end:chat-completion-sampling-params]
 
+    request_id_inference: Optional[str] = None
+    num_decode_tokens: Optional[int] = None
+
     # --8<-- [start:chat-completion-extra-params]
     echo: bool = Field(
         default=False,
@@ -552,7 +555,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=({"kv_transfer_params": self.kv_transfer_params}
-                        if self.kv_transfer_params else None))
+                        if self.kv_transfer_params else None),
+            request_id_inference=self.request_id_inference,
+            num_decode_tokens=self.num_decode_tokens,
+        )
 
     def _get_guided_json_from_tool(
             self) -> Optional[Union[str, dict, BaseModel]]:
@@ -788,6 +794,9 @@ class CompletionRequest(OpenAIBaseModel):
     prompt_logprobs: Optional[int] = None
     # --8<-- [end:completion-sampling-params]
 
+    request_id_inference: Optional[str] = None
+    num_decode_tokens: Optional[int] = None
+
     # --8<-- [start:completion-extra-params]
     add_special_tokens: bool = Field(
         default=True,
@@ -992,7 +1001,10 @@ class CompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=({"kv_transfer_params": self.kv_transfer_params}
-                        if self.kv_transfer_params else None))
+                        if self.kv_transfer_params else None),
+            request_id_inference=self.request_id_inference,
+            num_decode_tokens=self.num_decode_tokens,
+        )
 
     @model_validator(mode="before")
     @classmethod

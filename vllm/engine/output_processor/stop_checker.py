@@ -17,10 +17,12 @@ class StopChecker:
     """
 
     def __init__(self, max_model_len: int,
-                 get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer]):
+                 get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer],
+                 enable_auto_pd_offload: bool = False):
         # Do not use it directly, but use `self._get_max_model_len`.
         self._max_model_len = max_model_len
         self.get_tokenizer_for_seq = get_tokenizer_for_seq
+        self.enable_auto_pd_offload = enable_auto_pd_offload
 
     def _get_max_model_len(self, lora_req: Optional[LoRARequest]):
         if lora_req and lora_req.long_lora_max_len:
@@ -90,6 +92,13 @@ class StopChecker:
         if seq.get_output_len() == sampling_params.max_tokens:
             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
             return
+
+        # 动态调度任务（仅在启用自动PD卸载时）
+        if self.enable_auto_pd_offload and sampling_params.num_decode_tokens is not None:
+            # 当num_decode_tokens为0时终止任务
+            if sampling_params.num_decode_tokens == 0:
+                seq.status = SequenceStatus.SCHEDULED
+                return
 
     @staticmethod
     def check_stop_strings(

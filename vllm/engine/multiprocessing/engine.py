@@ -210,7 +210,7 @@ class MQLLMEngine:
         """Core busy loop of the LLMEngine."""
 
         while True:
-            if not self.engine.has_unfinished_requests():
+            if not self.engine.has_unfinished_seqs_for_sysHAX():
                 # Poll until there is work to do.
                 while self.input_socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
                     # When there's no work, check on engine health and send

@@ -26,7 +26,7 @@ def single_step_process_prompt_logprob(
     Do nothing if the output has no prompt logprobs.
 
     Account for the fact that transformers do not compute first-token logprobs.
-    
+
     Args:
       sg_output_proc:
           [`SequenceGroupOutputProcessor`][vllm.engine.output_processor.interfaces.SequenceGroupOutputProcessor]
@@ -90,7 +90,7 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
 
         Invokes detokenizer to detokenize new tokens, and also marks sequences
         as finished if they meet stop conditions.
-        
+
         is_async - Indicates whether this postprocessor runs in 
             parallel with the GPU forward pass and is processing 
             tokens from the previous step. If this is true, then
@@ -106,7 +106,7 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
                                outputs: List[SequenceGroupOutput]) -> None:
         """Process prompt logprobs associated with one step of a single-step-
         scheduled computation.
-        
+
         Args:
           seq_group: the output is associated with this
               [`SequenceGroup`][vllm.sequence.SequenceGroup]

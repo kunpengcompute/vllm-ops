@@ -38,6 +38,7 @@ class ExecutorBase(ABC):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        shared_memory_manager=None,
     ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -50,6 +51,7 @@ class ExecutorBase(ABC):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.shared_memory_manager = shared_memory_manager
         self._init_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
@@ -245,6 +247,28 @@ class ExecutorBase(ABC):
                             kwargs=dict(path=path,
                                         pattern=pattern,
                                         max_size=max_size))
+
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        raise NotImplementedError
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        raise NotImplementedError
+
+    def swap_block_gpu_cpu(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None
+    ) -> None:
+        raise NotImplementedError
 
     @abstractmethod
     def check_health(self) -> None:

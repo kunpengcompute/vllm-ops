@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
+import os
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -48,8 +49,27 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, maybe_prefix
+from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)
+
+inference_fused = False
+if os.getenv("INFERENCE_OP_MODE") == "fused":
+    inference_fused = True
+    print(f"run in INFERENCE FUSED MODE")
+
+    # 量化设置
+    quantization_bit_mode = os.getenv("SYSHAX_QUANTIZE")
+    quantization_bit_code = 1  # 默认是f16
+    if quantization_bit_mode != "":
+        if quantization_bit_mode == "q8_0":
+            quantization_bit_code = 8
+            print(f"Use q8_0 quantization!")
+        elif quantization_bit_mode == "q4_0":
+            quantization_bit_code = 2
+            print(f"Use q4_0 quantization!")
+        else:
+            print(f"Unsupported quantization type !")
 
 
 class Qwen3Attention(nn.Module):
@@ -288,6 +308,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
+        self._cpp_weight_loaded = False
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
@@ -298,6 +320,48 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if inference_fused:
+            self.fused_forward = True
+
+            # 获取全局 attention metadata
+            forward_ctx = get_forward_context()
+            attn_metadata = forward_ctx.attn_metadata
+            # 收集各层的 KV cache 列表
+            ve = forward_ctx.virtual_engine
+            kv_caches = [
+                layer.self_attn.attn.kv_cache[ve]
+                for layer in self.model.layers[self.model.start_layer:self.model.end_layer]
+            ]
+
+            model = self.model
+            block_size = 16
+            N_tokens = len(input_ids)
+            hidden_states = model.get_input_embeddings(input_ids)
+            model_output = torch.zeros(
+                (len(attn_metadata.seq_lens)
+                 if attn_metadata.prefill_metadata else N_tokens, self.config.vocab_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
+
+            torch.ops._C.get_next_token_for_torch(
+                model_output,
+                hidden_states,
+                attn_metadata.prefill_metadata is not None,
+                attn_metadata.block_tables,
+                attn_metadata.seq_lens_tensor,
+                attn_metadata.slot_mapping.flatten(),
+                positions,
+                kv_caches,
+                block_size,
+                N_tokens,
+                False,
+                True
+            )
+            return model_output
+        else:
+            self.fused_forward = False
+
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
@@ -307,6 +371,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        if inference_fused and self.fused_forward:
+            return hidden_states
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
@@ -318,4 +384,110 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        if inference_fused:
+            self._load_weight_to_cpp()
+        return loaded
+
+    def _load_weight_to_cpp(self):
+        if self._cpp_weight_loaded:
+            return
+
+        qkv_proj_weight, qkv_proj_bias, o_proj_weight, gate_up_proj_weight, down_proj_weight = [], [], [], [], []
+        q_norm_weight, k_norm_weight = [], []
+        input_layernorm_weight, post_attention_layernorm_weight = [], []
+        norm_weight, lm_head_weight = [], []
+        for i in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[i]
+
+            input_layernorm_weight.append(layer.input_layernorm.weight)
+            layer.input_layernorm.weight = None
+
+            qkv_proj_weight.append(layer.self_attn.qkv_proj.weight)
+            layer.self_attn.qkv_proj.weight = None
+
+            if layer.self_attn.q_norm.weight is not None:
+                q_norm_weight.append(layer.self_attn.q_norm.weight)
+                layer.self_attn.q_norm.weight = None
+
+            if layer.self_attn.k_norm.weight is not None:
+                k_norm_weight.append(layer.self_attn.k_norm.weight)
+                layer.self_attn.k_norm.weight = None
+
+            if layer.self_attn.qkv_proj.bias is not None:
+                qkv_proj_bias.append(layer.self_attn.qkv_proj.bias)
+                layer.self_attn.qkv_proj.bias = None
+
+            o_proj_weight.append(layer.self_attn.o_proj.weight)
+            layer.self_attn.o_proj.weight = None
+
+            post_attention_layernorm_weight.append(
+                layer.post_attention_layernorm.weight)
+            layer.post_attention_layernorm.weight = None
+
+            gate_up_proj_weight.append(layer.mlp.gate_up_proj.weight)
+            layer.mlp.gate_up_proj.weight = None
+
+            down_proj_weight.append(layer.mlp.down_proj.weight)
+            layer.mlp.down_proj.weight = None
+
+        norm_weight.append(self.model.norm.weight)
+        self.model.norm.weight = None
+        lm_head_weight.append(self.lm_head.weight)
+
+        if self.model.config.tie_word_embeddings:
+            embed_tokens_weight = self.lm_head.weight
+        else:
+            embed_tokens_weight = self.model.embed_tokens.weight
+            self.lm_head.weight = None
+
+        first_attn = self.model.layers[0].self_attn
+        input_layernorm_weight = torch.stack(input_layernorm_weight)
+        qkv_proj_weight = torch.stack(qkv_proj_weight)
+        q_norm_weight = torch.stack(q_norm_weight)
+        k_norm_weight = torch.stack(k_norm_weight)
+
+        if len(qkv_proj_bias) > 0:
+            qkv_proj_bias = torch.stack(qkv_proj_bias)
+        else:
+            device = qkv_proj_weight.device
+            dtype = qkv_proj_weight.dtype
+            qkv_dim = qkv_proj_weight.shape[-1]
+            n_layers = qkv_proj_weight.shape[0]
+            qkv_proj_bias = torch.zeros(
+                n_layers, qkv_dim, device=device, dtype=dtype)
+
+        o_proj_weight = torch.stack(o_proj_weight)
+        post_attention_layernorm_weight = torch.stack(
+            post_attention_layernorm_weight)
+        gate_up_proj_weight = torch.stack(gate_up_proj_weight)
+        down_proj_weight = torch.stack(down_proj_weight)
+        norm_weight = torch.stack(norm_weight)
+        lm_head_weight = torch.stack(lm_head_weight)
+
+        torch.ops._C.load_model_config(
+            self.model.config.model_type,
+            self.model.config.head_dim, self.model.config.hidden_size, self.model.config.intermediate_size,
+            self.model.config.num_attention_heads, self.model.config.num_hidden_layers, self.model.config.vocab_size,
+            self.model.config.num_key_value_heads, self.model.config.sliding_window if self.model.config.use_sliding_window else self.model.config.max_position_embeddings,
+            self.model.config.rms_norm_eps, self.model.config.rope_theta, first_attn.attn.impl.scale,
+            first_attn.rotary_emb.is_neox_style, first_attn.rotary_emb.cos_sin_cache,
+            quantization_bit_code
+        )
+
+        torch.ops._C.load_weight_unified(
+            self.model.config.model_type,
+            embed_tokens_weight,
+            input_layernorm_weight,
+            post_attention_layernorm_weight,
+            qkv_proj_weight,
+            o_proj_weight,
+            qkv_proj_bias,
+            gate_up_proj_weight,
+            down_proj_weight,
+            norm_weight,
+            lm_head_weight,
+            q_norm_weight,
+            k_norm_weight
+        )
+        self._cpp_weight_loaded = True

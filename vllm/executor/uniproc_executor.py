@@ -25,7 +25,8 @@ class UniProcExecutor(ExecutorBase):
         """Initialize the worker and load the model.
         """
         self.driver_worker = WorkerWrapperBase(vllm_config=self.vllm_config,
-                                               rpc_rank=0)
+                                               rpc_rank=0,
+                                               shared_memory_manager=self.shared_memory_manager)
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
         local_rank = 0
@@ -61,6 +62,28 @@ class UniProcExecutor(ExecutorBase):
         # UniProcExecutor will always be healthy as long as
         # it's running.
         return
+
+    def copy_block_to_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        return self.driver_worker.copy_block_to_sharememory(virtual_engine, request_id, physical_block_mapping)
+
+    def copy_block_from_sharememory(
+        self,
+        virtual_engine: int,
+        request_id: str,
+        physical_block_mapping: dict[int, List[int]]
+    ) -> bool:
+        return self.driver_worker.copy_block_from_sharememory(virtual_engine, request_id, physical_block_mapping)
+
+    def swap_block_gpu_cpu(
+        self,
+        execute_model_req=None
+    ) -> None:
+        return self.driver_worker.swap_block_gpu_cpu(execute_model_req=execute_model_req)
 
 
 UniProcExecutorAsync = UniProcExecutor

@@ -62,6 +62,9 @@ from vllm.utils import Counter, Device, resolve_obj_by_qualname, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
 
+# 导入共享内存管理器
+from vllm.core.shared_memory import SharedMemoryManager
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -235,6 +238,16 @@ class LLMEngine:
             use_cached_outputs,
         )
 
+        # 初始化共享内存管理器（仅在启用自动PD卸载时）
+        if vllm_config.enable_auto_pd_offload:
+            is_gpu_instance = (self.device_config.device.type == "cuda")
+            self.shared_memory_manager = SharedMemoryManager(
+                is_gpu_instance=is_gpu_instance)
+            logger.info("已初始化共享内存管理器，用于KV缓存共享")
+        else:
+            self.shared_memory_manager = None
+            logger.info("未启用自动PD卸载，跳过共享内存管理器初始化")
+
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
@@ -262,7 +275,10 @@ class LLMEngine:
                                                     self.tokenizer,
                                                     mm_registry)
 
-        self.model_executor = executor_class(vllm_config=vllm_config)
+        self.model_executor = executor_class(
+            vllm_config=vllm_config,
+            shared_memory_manager=self.shared_memory_manager,
+        )
 
         if self.model_config.runner_type != "pooling":
             self._initialize_kv_caches()
@@ -343,7 +359,8 @@ class LLMEngine:
                 self.scheduler_config, self.cache_config, self.lora_config,
                 self.parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id]
-                if self.model_config.use_async_output_proc else None)
+                if self.model_config.use_async_output_proc else None,
+                shared_memory_manager=self.shared_memory_manager)
             for v_id in range(self.parallel_config.pipeline_parallel_size)
         ]
 
@@ -390,7 +407,8 @@ class LLMEngine:
                 self.seq_counter,
                 get_tokenizer_for_seq,
                 stop_checker=StopChecker(self.scheduler_config.max_model_len,
-                                         get_tokenizer_for_seq),
+                                         get_tokenizer_for_seq,
+                                         enable_auto_pd_offload=vllm_config.enable_auto_pd_offload),
             ))
 
         self.seq_id_to_seq_group: Dict[str, SequenceGroupBase] = {}
@@ -498,12 +516,17 @@ class LLMEngine:
             from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
             engine_cls = V1LLMEngine
 
-        return engine_cls.from_vllm_config(
+        engine = engine_cls.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
             disable_log_stats=engine_args.disable_log_stats,
         )
+        # Store use_greedy flag to allow CPU-mode default greedy setting.
+        engine.use_greedy = engine_args.use_greedy
+        # Store enable_auto_pd_offload flag to control auto PD offload functionality.
+        engine.enable_auto_pd_offload = engine_args.enable_auto_pd_offload
+        return engine
 
     def __reduce__(self):
         # This is to ensure that the LLMEngine is not referenced in
@@ -718,6 +741,11 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
         )
 
+        # Override temperature to 0.0 in CPU mode when use_greedy is enabled.
+        if isinstance(params, SamplingParams) and self.device_config.device.type == "cpu" and getattr(self, 'use_greedy', True):
+            logger.info("CPU 模式：启用 Greedy 模式，已将 temperature 设置为 0.0，可以使用 --use-greedy=false 来取消。")
+            params.temperature = 0.0
+
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -856,6 +884,13 @@ class LLMEngine:
     def has_unfinished_requests(self) -> bool:
         """Returns True if there are unfinished requests."""
         return any(scheduler.has_unfinished_seqs()
+                   for scheduler in self.scheduler)
+
+    def has_unfinished_seqs_for_sysHAX(self) -> bool:
+        """
+        Returns True if there are unfinished requests for the sysHAX.
+        """
+        return any(scheduler.has_unfinished_seqs_for_sysHAX()
                    for scheduler in self.scheduler)
 
     def has_unfinished_requests_for_virtual_engine(
@@ -1027,13 +1062,16 @@ class LLMEngine:
                 output = [outputs_by_sequence_group[0][i]]
 
             if not is_async:
-                if self.scheduler_config.is_multi_step:
-                    # Updates happen only if the sequence is prefill
-                    self._update_num_computed_tokens_for_multi_step_prefill(
-                        seq_group, seq_group_meta, is_first_step_output)
-                else:
-                    seq_group.update_num_computed_tokens(
-                        seq_group_meta.token_chunk_size or 0)
+                # Skip computed tokens update for decode-relay tasks
+                params = seq_group.sampling_params
+                if params is not None and params.request_id_inference is None:
+                    if self.scheduler_config.is_multi_step:
+                        # Updates happen only if the sequence is prefill
+                        self._update_num_computed_tokens_for_multi_step_prefill(
+                            seq_group, seq_group_meta, is_first_step_output)
+                    else:
+                        seq_group.update_num_computed_tokens(
+                            seq_group_meta.token_chunk_size or 0)
 
             if outputs:
                 for o in outputs:
@@ -1057,8 +1095,57 @@ class LLMEngine:
             else:
                 self.output_processor.process_prompt_logprob(seq_group, output)
                 if seq_group_meta.do_sample:
+                    # 初始化kv cache相关变量
+                    need_store_kv_cache = False
+                    kv_cache_mapping = None
+
+                    # 在StopChecker之前处理kv cache上传
+                    if (self.shared_memory_manager is not None
+                        and seq_group.sampling_params is not None
+                        and seq_group.sampling_params.num_decode_tokens is not None
+                            and not seq_group.is_prefill()):
+
+                        # 递减num_decode_tokens
+                        if seq_group.sampling_params.num_decode_tokens > 0:
+                            seq_group.sampling_params.num_decode_tokens -= 1
+
+                        # 检查是否到达最后一个token，如果是，先准备kv cache数据
+                        need_store_kv_cache = seq_group.sampling_params.num_decode_tokens == 0
+
+                        if need_store_kv_cache:
+                            # 在process_outputs之前，先获取所有需要的信息
+                            kv_cache_mapping = {}
+                            for seq in seq_group.get_seqs():
+                                block_table = self.scheduler[0].block_manager.block_tables[seq.seq_id]
+                                block_ids = block_table.physical_block_ids.copy()
+                                kv_cache_mapping[seq.seq_id] = block_ids
+
+                    # 处理输出，添加token
                     self.output_processor.process_outputs(
                         seq_group, output, is_async)
+
+                    # 在process_outputs之后，如果需要存储kv cache，则进行处理
+                    if need_store_kv_cache and kv_cache_mapping is not None:
+                        # 保存到共享内存
+                        seq_group.physical_block_mapping = self.scheduler[0].store_kv_cache(
+                            seq_group, kv_cache_mapping)
+
+                        # 上传到共享内存
+                        if seq_group.physical_block_mapping:
+                            success_copy = self.model_executor.copy_block_to_sharememory(
+                                virtual_engine=0,
+                                request_id=seq_group.request_id,
+                                physical_block_mapping=seq_group.physical_block_mapping
+                            )
+                            # 现在存储包含最后一个token的完整output_token_ids
+                            output_ids: Dict[int, List[int]] = {
+                                seq.seq_id: list(
+                                    seq.data.get_output_token_ids())
+                                for seq in seq_group.get_seqs()
+                            }
+                            self.shared_memory_manager.set_output_token_ids(
+                                seq_group.request_id, output_ids
+                            )
 
             if seq_group.is_finished():
                 finished_now.append(i)
@@ -1078,6 +1165,13 @@ class LLMEngine:
             if request_output:
                 ctx.request_outputs.append(request_output)
 
+            # 清理完成请求的共享内存（如果有request_id_inference参数）
+            if (seq_group.sampling_params is not None
+                and self.shared_memory_manager is not None
+                    and seq_group.sampling_params.request_id_inference is not None):
+                self.shared_memory_manager.cleanup_request(
+                    seq_group.sampling_params.request_id_inference)
+
         # When we process a single request, we skip it for the next time,
         # and invoke the request output callback (if there was final output)
         if request_id:
@@ -1094,6 +1188,50 @@ class LLMEngine:
         if finished_now:
             for scheduler in self.scheduler:
                 scheduler.free_finished_seq_groups()
+
+        # AUTO_PD_OFFLOAD: 处理swapped队列中的SCHEDULED序列，为它们生成RequestOutput
+        if self.shared_memory_manager is not None:
+            for scheduler in self.scheduler:
+                scheduled_seq_groups = []
+
+                for seq_group in list(scheduler.swapped):
+                    if seq_group.is_scheduled():
+                        # 检查是否已经处理过，避免重复生成RequestOutput
+                        if hasattr(seq_group, '_auto_pd_offload_processed'):
+                            continue
+
+                        # 为SCHEDULED状态的序列生成RequestOutput
+                        seq_group.maybe_set_first_token_time(now)
+                        if not seq_group.is_prefill():
+                            seq_group.set_last_token_time(now)
+                        request_output = RequestOutputFactory.create(
+                            seq_group,
+                            self.seq_id_to_seq_group,
+                            use_cache=self.use_cached_outputs)
+                        if request_output:
+                            ctx.request_outputs.append(request_output)
+                            scheduled_seq_groups.append(seq_group)
+                            logger.debug(
+                                f"为AUTO_PD_OFFLOAD序列组 {seq_group.request_id} 生成了RequestOutput")
+
+                            # 标记为已处理，避免重复处理
+                            seq_group._auto_pd_offload_processed = True
+
+                        # 清理完成请求的共享内存
+                        if (seq_group.sampling_params is not None
+                                and seq_group.sampling_params.request_id_inference is not None):
+                            self.shared_memory_manager.cleanup_request(
+                                seq_group.sampling_params.request_id_inference)
+
+                # 立即从swapped队列中移除已处理的序列，避免重复处理
+                for seq_group in scheduled_seq_groups:
+                    if seq_group in scheduler.swapped:
+                        scheduler.swapped.remove(seq_group)
+
+                # 记录处理的序列组数量
+                if scheduled_seq_groups:
+                    logger.debug(
+                        f"AUTO_PD_OFFLOAD: 为 {len(scheduled_seq_groups)} 个swapped队列中的SCHEDULED序列生成了RequestOutput")
 
         # For multi-step without streaming, don't create outputs each iteration
         if not is_last_step and not ctx.multi_step_stream_outputs:
@@ -1244,7 +1382,7 @@ class LLMEngine:
         engine = LLMEngine.from_engine_args(engine_args)
         example_inputs = [(0, "What is LLM?",
         SamplingParams(temperature=0.0))]
-    
+
         # Start the engine with an event loop
         while True:
             if example_inputs:
@@ -1332,6 +1470,17 @@ class LLMEngine:
             last_sampled_token_ids = \
                 self._get_last_sampled_token_ids(virtual_engine)
 
+            # 处理AUTO_PD_OFFLOAD逻辑
+            if (self.vllm_config.enable_auto_pd_offload and
+                self.shared_memory_manager is not None and
+                    scheduler_outputs.blocks_to_swap_out):
+
+                # 处理需要swap out的请求进行kv cache导出
+                self._handle_auto_pd_offload_swap_out(virtual_engine)
+
+                # 清空blocks_to_swap_out，因为我们已经处理了这些请求
+                scheduler_outputs.blocks_to_swap_out = []
+
             execute_model_req = ExecuteModelRequest(
                 seq_group_metadata_list=seq_group_metadata_list,
                 blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
@@ -1343,6 +1492,22 @@ class LLMEngine:
                 # We use ExecuteModelRequest to pass the last sampled_token_ids
                 # to each of the non-last PP stages for in-place prepare_input.
                 last_sampled_token_ids=last_sampled_token_ids)
+
+            if self.shared_memory_manager is not None:
+                # 接力 decode 阶段加载接力数据，GPU、CPU 通用
+                for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+                    seq_group = scheduled_seq_group.seq_group
+                    params = seq_group.sampling_params
+                    if seq_group.is_load_prefill_kvcache:
+                        continue
+                    if params is not None and params.num_decode_tokens is not None:
+                        if params.request_id_inference is not None:
+                            success_copy = self.model_executor.copy_block_from_sharememory(
+                                virtual_engine=virtual_engine,
+                                request_id=params.request_id_inference,
+                                physical_block_mapping=seq_group.physical_block_mapping
+                            )
+                            seq_group.is_load_prefill_kvcache = True
 
             if allow_async_output_proc:
                 execute_model_req.async_callback = self.async_callbacks[
@@ -1423,7 +1588,7 @@ class LLMEngine:
             # Multi-step case
             return ctx.request_outputs
 
-        if not self.has_unfinished_requests():
+        if not self.has_unfinished_seqs_for_sysHAX():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
                 self._process_model_outputs(ctx=ctx)
@@ -1436,6 +1601,11 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+            seq_group = scheduled_seq_group.seq_group
+            for seq in seq_group.get_seqs():
+                seq.scheduled_finished = True
 
         return ctx.request_outputs
 
@@ -2090,6 +2260,138 @@ class LLMEngine:
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args,
                                                   kwargs)
+
+    def _handle_auto_pd_offload_swap_out(self, virtual_engine: int) -> None:
+        """
+        处理AUTO_PD_OFFLOAD模式下的swap out请求。
+
+        将需要swap out的序列组的KV cache导出到共享内存，
+        然后通过StopChecker将这些序列标记为SCHEDULED状态。
+
+        Args:
+            virtual_engine: 虚拟引擎ID
+        """
+        if not self.shared_memory_manager:
+            logger.warning("AUTO_PD_OFFLOAD被触发但shared_memory_manager为None")
+            return
+
+        # 检查swapped队列是否有需要处理的序列组
+        if not self.scheduler[virtual_engine].swapped:
+            return
+
+        logger.debug(
+            f"发现 {len(self.scheduler[virtual_engine].swapped)} 个被swap out的序列组，准备进行AUTO_PD_OFFLOAD处理")
+
+        # 收集需要标记为SCHEDULED的序列组
+        seq_groups_to_schedule = []
+
+        # 为每个被swap out的序列组处理KV cache导出
+        for seq_group in self.scheduler[virtual_engine].swapped:
+            try:
+                # 跳过已经处理过的序列组（num_decode_tokens已设置为0）
+                if (seq_group.sampling_params is not None and
+                        seq_group.sampling_params.num_decode_tokens == 0):
+                    continue
+
+                # 使用预存储的物理块映射（在swap out之前获取）
+                kv_cache_mapping = getattr(
+                    seq_group, 'auto_pd_offload_mapping', None)
+
+                if not kv_cache_mapping:
+                    logger.warning(
+                        f"序列组 {seq_group.request_id} 没有预存储的物理块映射，跳过处理")
+                    continue
+
+                # 保存到共享内存
+                swapped_seqs = seq_group.get_seqs(
+                    status=SequenceStatus.SWAPPED)
+                kv_cache_data = {
+                    "physical_block_id_mapping": kv_cache_mapping,
+                    "device": 'gpu',
+                    "physical_blocks_meta": None,
+                    "output_token_ids": {seq.seq_id: seq.data.output_token_ids for seq in swapped_seqs},
+                }
+
+                # 存储逻辑块数据到共享内存
+                if self.shared_memory_manager.store_logical_block(seq_group.request_id, kv_cache_data):
+                    logger.debug(
+                        f"成功将序列组 {seq_group.request_id} 的KV缓存逻辑数据上传到共享内存")
+
+                    # 上传物理块数据到共享内存
+                    success = self.model_executor.copy_block_to_sharememory(
+                        virtual_engine=virtual_engine,
+                        request_id=seq_group.request_id,
+                        physical_block_mapping=kv_cache_mapping
+                    )
+
+                    if success:
+                        logger.debug(f"成功上传序列组 {seq_group.request_id} 的物理块数据到共享内存")
+
+                        # 设置sampling_params的num_decode_tokens为0，这样会在StopChecker中被检测到并结束
+                        if seq_group.sampling_params is not None:
+                            seq_group.sampling_params.num_decode_tokens = 0
+                            logger.debug(f"设置序列组 {seq_group.request_id} 的num_decode_tokens为0，准备通过StopChecker标记为SCHEDULED")
+
+                        # 添加到待处理列表
+                        seq_groups_to_schedule.append(seq_group)
+
+                    else:
+                        logger.error(f"上传序列组 {seq_group.request_id} 的物理块数据到共享内存失败")
+                else:
+                    logger.error(f"存储序列组 {seq_group.request_id} 的KV缓存逻辑数据到共享内存失败")
+
+            except Exception as e:
+                logger.error(f"处理序列组 {seq_group.request_id} 的AUTO_PD_OFFLOAD时发生错误: {e}")
+
+        # 如果有需要处理的序列组，触发StopChecker让它们走正常流程
+        if seq_groups_to_schedule:
+            self._trigger_stop_checker_for_auto_pd_offload(
+                seq_groups_to_schedule)
+
+    def _trigger_stop_checker_for_auto_pd_offload(self, seq_groups: List[SequenceGroup]) -> None:
+        """
+        为AUTO_PD_OFFLOAD的序列组触发正常的stop_checker流程。
+
+        直接调用StopChecker基于num_decode_tokens=0来标记序列为SCHEDULED状态。
+
+        Args:
+            seq_groups: 需要处理的序列组列表
+        """
+        try:
+            # 为每个序列组直接调用StopChecker检查
+            for seq_group in seq_groups:
+                # 获取swapped状态的序列
+                swapped_seqs = seq_group.get_seqs(
+                    status=SequenceStatus.SWAPPED)
+
+                for seq in swapped_seqs:
+                    # 临时将序列状态改为RUNNING，这样才能被正常处理
+                    seq.status = SequenceStatus.RUNNING
+
+                    # 直接调用StopChecker检查停止条件
+                    # 由于num_decode_tokens=0，这应该会将序列状态设置为SCHEDULED
+                    self.output_processor.stop_checker.maybe_stop_sequence(
+                        seq,
+                        new_char_count=0,  # 没有新字符
+                        sampling_params=seq_group.sampling_params,
+                        lora_req=seq_group.lora_request,
+                    )
+
+                    # 检查序列是否被标记为完成
+                    if seq.status == SequenceStatus.SCHEDULED:
+                        logger.debug(f"序列 {seq.seq_id} 通过StopChecker被标记为SCHEDULED")
+                    else:
+                        logger.warning(f"序列 {seq.seq_id} 状态为 {seq.status}，未被正确处理")
+
+                # 清理预存储的mapping数据
+                if hasattr(seq_group, 'auto_pd_offload_mapping'):
+                    delattr(seq_group, 'auto_pd_offload_mapping')
+                    logger.debug(f"已清理序列组 {seq_group.request_id} 的mapping数据")
+
+                logger.debug(f"已为序列组 {seq_group.request_id} 完成StopChecker处理流程")
+
+        except Exception as e:
+            logger.error(f"为AUTO_PD_OFFLOAD序列组处理StopChecker时发生错误: {e}")
 
 
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
