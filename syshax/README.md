@@ -86,7 +86,8 @@ if isinstance(params, SamplingParams) and self.device_config.device.type == "cpu
 ```python
 if isinstance(params, SamplingParams) and getattr(self, 'use_greedy', True):
 ```
-后，重新添加patch
+完成操作后，重新添加patch
+
 ---
 
 # 贡献指南
@@ -94,4 +95,4 @@ if isinstance(params, SamplingParams) and getattr(self, 'use_greedy', True):
 
 
 # 免责声明
-此代码仓计划参与vllm软件开源，仅作cpu推理性能提升和，编码风格遵照原生开源软件，继承原生开源软件安全设计，不破坏原生开源软件设计及编码风格和方式，软件的任何漏洞与安全问题，均由相应的上游社区根据其漏洞和安全响应机制解决。请密切关注上游社区发布的通知和版本更新。鲲鹏计算社区对软件的漏洞及安全问题不承担任何责任。
+此代码仓计划参与vllm软件开源，仅作cpu推理性能提升和gpu侧的框架适配，编码风格遵照原生开源软件，继承原生开源软件安全设计，不破坏原生开源软件设计及编码风格和方式，软件的任何漏洞与安全问题，均由相应的上游社区根据其漏洞和安全响应机制解决。请密切关注上游社区发布的通知和版本更新。鲲鹏计算社区对软件的漏洞及安全问题不承担任何责任。
