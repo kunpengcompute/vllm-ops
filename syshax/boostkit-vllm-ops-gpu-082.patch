@@ -1089,9 +1089,9 @@ index bce7736..e748d4a 100644
          )
          processed_inputs = self.input_processor(preprocessed_inputs)
  
-+        # Override temperature to 0.0 in CPU mode when use_greedy is enabled.
-+        if isinstance(params, SamplingParams) and self.device_config.device.type == "cpu" and getattr(self, 'use_greedy', True):
-+            logger.info("CPU 模式：启用 Greedy 模式，已将 temperature 设置为 0.0，可以使用 --use-greedy=false 来取消。")
++        # Override temperature to 0.0 when use_greedy is enabled.
++        if isinstance(params, SamplingParams) and getattr(self, 'use_greedy', True):
++            logger.info("启用 Greedy 模式，已将 temperature 设置为 0.0，可以使用 --use-greedy=false 来取消。")
 +            params.temperature = 0.0
 +
          self._add_processed_request(
