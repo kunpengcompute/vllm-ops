@@ -2908,4 +2908,3 @@ index cebf541..fe1b84e 100644
          self.vllm_config = kwargs.get("vllm_config", None)
          assert self.vllm_config is not None, (
              "vllm_config is required to initialize the worker")
-x
