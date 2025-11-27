@@ -946,7 +946,7 @@ index 1c8f25d..b04b3c4 100644
      use_tqdm_on_load: bool = True
  
 +    # Additional parameters for custom features
-+    use_greedy: bool = True
++    use_greedy: bool = False
 +    enable_auto_pd_offload: bool = False
 +
      def __post_init__(self):
@@ -959,7 +959,7 @@ index 1c8f25d..b04b3c4 100644
 +        parser.add_argument(
 +            '--use-greedy',
 +            action='store_true',
-+            default=True,
++            default=False,
 +            help='Whether to enable greedy mode in CPU mode (sets temperature to 0.0 by default). Accepts true or false'
 +        )
 +
@@ -1090,8 +1090,8 @@ index bce7736..e748d4a 100644
          processed_inputs = self.input_processor(preprocessed_inputs)
  
 +        # Override temperature to 0.0 when use_greedy is enabled.
-+        if isinstance(params, SamplingParams) and getattr(self, 'use_greedy', True):
-+            logger.info("启用 Greedy 模式，已将 temperature 设置为 0.0，可以使用 --use-greedy=false 来取消。")
++        if isinstance(params, SamplingParams) and getattr(self, 'use_greedy', False):
++            logger.info("启用 Greedy 模式")
 +            params.temperature = 0.0
 +
          self._add_processed_request(
