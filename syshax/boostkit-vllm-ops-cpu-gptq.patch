@@ -161,7 +161,7 @@ index 939c3fe97..247f866db 100644
 +    
 +    # 遍历模型所有模块
 +    for name, module in model.named_modules():
-+        print(name)
++        
 +        # 处理 self_attn 的 q/k/v/o_proj
 +        for proj in ["q_proj", "k_proj", "v_proj","qkv_proj", "o_proj"]:
 +            if hasattr(module, proj):
@@ -173,7 +173,7 @@ index 939c3fe97..247f866db 100644
 +                    for attr in ["qweight", "scales", "qzeros", "g_idx"]:
 +                        if hasattr(m, attr):
 +                            delattr(m, attr)
-+                    # print("WEIGHT:",m.weight,"\ntype:",m.weight.type())
++                    
 +                
 +
 +        
