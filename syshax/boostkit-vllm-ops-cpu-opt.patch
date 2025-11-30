@@ -1644,32 +1644,6 @@ index 9692632..7f828e0 100644
  #endif
  }
  
-diff --git a/vllm/config.py b/vllm/config.py
-index 6357eb7..f7e0473 100644
---- a/vllm/config.py
-+++ b/vllm/config.py
-@@ -895,21 +895,6 @@ class ModelConfig:
-                 method = get_quantization_config(name)
-                 quantization_override = method.override_quantization_method(
-                     quant_cfg, self.quantization)
--                if quantization_override is not None:
--                    # Raise error if the override is not custom (custom would
--                    # be in QUANTIZATION_METHODS but not QuantizationMethods)
--                    # and hasn't been added to the overrides list.
--                    if (name in get_args(QuantizationMethods)
--                            and name not in overrides):
--                        raise ValueError(
--                            f"Quantization method {name} is an override but "
--                            "is has not been added to the `overrides` list "
--                            "above. This is necessary to ensure that the "
--                            "overrides are checked in order of preference.")
--                    quant_method = quantization_override
--                    self.quantization = quantization_override
--                    break
--
-             # Verify quantization configurations.
-             if self.quantization is None:
-                 self.quantization = quant_method
 diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
 index 1737d67..397d2d7 100644
 --- a/vllm/model_executor/layers/sampler.py
