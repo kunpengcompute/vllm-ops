@@ -1483,6 +1483,19 @@ index 739cbed..1e36236 100644
      try:
          # Ensure we can serialize transformer config before spawning
          maybe_register_config_serialize_by_value()
+@@ -439,7 +440,11 @@ def run_mp_engine(vllm_config: VllmConfig, usage_context: UsageContext,
+             disable_log_stats=disable_log_stats,
+             disable_log_requests=disable_log_requests,
+             ipc_path=ipc_path)
+-
++            
++        # Store use_greedy flag to allow CPU-mode default greedy setting.
++        engine.engine.use_greedy = use_greedy
++        # Store enable_auto_pd_offload flag to control auto PD offload functionality.
++        engine.engine.enable_auto_pd_offload = enable_auto_pd_offload
+         signal.signal(signal.SIGTERM, signal_handler)
+ 
+         engine.start()
 diff --git a/vllm/engine/output_processor/stop_checker.py b/vllm/engine/output_processor/stop_checker.py
 index 6cad9ec..052eb81 100644
 --- a/vllm/engine/output_processor/stop_checker.py
