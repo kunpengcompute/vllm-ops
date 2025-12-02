@@ -10,7 +10,7 @@ vllm-ops是鲲鹏自研的向量检索加速组件，对接vllm使用。本仓�
 |---------------|------|
 | **boostkit-vllm-ops-gpu-082.patch** | 适配 GPU 端运行 **vLLM 0.8.2** 版本，解决接口差异及依赖兼容问题。 |
 | **boostkit-vllm-ops-cpu-gptq.patch** | 适配 CPU 端加载 **GPTQ 量化模型**，支持量化参数解析与推理执行。 |
-| **boostkit-vllm-ops-op-speed.patch** | 优化算子执行性能，减少 CPU/GPU 端瓶颈，提高整体推理速度。 |
+| **boostkit-vllm-ops-cpu-opt.patch** | 优化算子执行性能，减少 CPU/GPU 端瓶颈，提高整体推理速度。 |
 
 ---
 
@@ -28,7 +28,7 @@ vllm-ops是鲲鹏自研的向量检索加速组件，对接vllm使用。本仓�
 
 #### 1、获取模型
 
-从地址 https://modelscope.cn/models/tclf90/deepseek-r1-distill-qwen-32b-gptq-int8 获取模型，参考链接中方式下载模型到本地目录。
+从 [模型地址](https://modelscope.cn/models/tclf90/deepseek-r1-distill-qwen-32b-gptq-int8) 获取模型，参考链接中方式下载模型到本地目录。
 
 参考下载方式：
 
@@ -42,7 +42,7 @@ modelscope download --model tclf90/deepseek-r1-distill-qwen-32b-gptq-int8 --loca
 
 #### 2、获取容器
 
-参考sysHax的指南 https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md
+参考 [sysHax部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md)
 
 获取得到 sysHAX cpu部分的容器（此处为syshax-vllm-cpu:0.2.1版本）
 
@@ -103,7 +103,7 @@ Location: /opt/conda/lib/python3.10/site-packages
 进入对应路径后，先对代码进行备份，然后打上patch
 ```bash
 cd /opt/conda/lib/python3.10/site-packages
-cp vllm vllm.back
+cp -r vllm vllm.back
 git apply boostkit-vllm-ops-gpu-082.patch
 ```
 
@@ -113,7 +113,7 @@ git apply boostkit-vllm-ops-gpu-082.patch
 git clone https://gitcode.com/boostkit/vllm-ops.git -b dev
 git apply boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
 git apply boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
-VLLM_TARGET_DEVICE=cpu pip install -v -e .
+VLLM_TARGET_DEVICE=cpu pip install -v .
 ```
 
 #### 5、启动服务
@@ -124,15 +124,17 @@ VLLM_TARGET_DEVICE=cpu pip install -v -e .
 
 gpu容器：
 ```bash
-vllm serve your_model   --host 0.0.0.0   --port 8001   --dtype=half   --swap_space=16  --block_size=16   --preemption_mode=swap   --max_model_len=4096   --tensor-parallel-size 1   --gpu_memory_utilization=0.95 --enable-auto-pd-offload    --enforce-eager --use_greedy
+VLLM_USE_V1=0 taskset -c 36-39,76-79,116-119,156-159 vllm serve your_model   --host 0.0.0.0   --port 8001   --dtype=half   --swap_space=16  --block_size=16   --preemption_mode=swap   --max_model_len=4096   --tensor-parallel-size 1   --gpu_memory_utilization=0.95 --enable-auto-pd-offload    --enforce-eager --use_greedy
 ```
 
 cpu容器：
-```
+```bash
 VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFINITY="0-31,40-71,80-111,120-151" SYSHAX_QUANTIZE=q4_0 vllm serve your_model     --host 0.0.0.0     --port 8002     --dtype=half     --block_size=16     --preemption_mode=swap     --max_model_len=8192     --enable-auto-pd-offload  --tensor-parallel-size 1 --use_greedy
 ```
 
 注：cpu侧不要使用所有的核心，预留部分核心供gpu调度及部分计算使用。
+
+sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md) 的源码部署模式进行部署。
 
 ---
 
