@@ -5,6 +5,20 @@ vllm在鲲鹏平台上推理性能加速
 本目录包含针对vllm及相关插件的功能增强及性能优化补丁
 这些补丁可以独立或组合使用，用于适配对应环境以及优化插件性能。
 
+# 目录结构与模块说明
+
+## syshax — sysHAX 加速模块
+
+该目录包含920少卡 sysHAX 场景下的补丁，包括：
+
+
+| 文件 | 作用 |
+|------|------|
+| **boostkit-vllm-ops-gpu-082.patch** | 适配 GPU 侧 vLLM 0.8.2 使用 sysHAX 调度模块 |
+| **boostkit-vllm-ops-cpu-gptq.patch** | CPU 侧 GPTQ INT4/INT8 权重读取与执行加速补丁 |
+| **boostkit-vllm-ops-cpu-opt.patch** | CPU 推理算子加速优化相关补丁 |
+| **README.md** | sysHAX 加速模块的详细使用说明 |
+
 
 # 贡献指南
 如果使用过程中有任何问题，或者需要反馈特性需求和bug报告，可以提交isssues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。
