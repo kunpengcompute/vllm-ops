@@ -1538,7 +1538,7 @@ index f9b1d69..dbfbd7b 100644
                    engine_args.disable_log_stats,
 -                  engine_args.disable_log_requests, engine_alive))
 +                  engine_args.disable_log_requests, engine_alive,
-+                  engine_args.use_greedy, engine_args.enable_auto_pd_offload)))
++                  engine_args.use_greedy, engine_args.enable_auto_pd_offload))
          engine_process.start()
          engine_pid = engine_process.pid
          assert engine_pid is not None, "Engine process failed to start."

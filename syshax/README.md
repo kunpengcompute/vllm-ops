@@ -60,7 +60,8 @@ docker pull hub.oepkgs.net/neocopilot/syshax/syshax-vllm-cpu:0.2.1
 docker run --name vllm_gpu \
     --ipc="shareable" \
     --shm-size=64g \
-    --gpus=all \
+    --device=/dev/mxcd \
+    --device=/dev/dri \
     -p 8001:8001 \
     -v /home/models:/home/models \
     -w /home/ \
@@ -71,7 +72,7 @@ docker run --name vllm_gpu \
 
 > --ipc="shareable"：允许容器共享IPC命名空间，可进行进程间通信。
 > --shm-size=64g：设置容器共享内存为64G。
-> --gpus=all：允许容器使用宿主机所有GPU设备
+> --device=/dev/mxcd --device=/dev/dri：容器访问沐曦硬件需要的参数，使用其他算力卡时请修改为对应参数。
 > -p 8001:8001：端口映射，将宿主机的8001端口与容器的8001端口进行映射，开发者可自行修改。
 > -v /home/models:/home/models：目录挂载，将宿主机的 /home/models 映射到容器内的 /home/models 内，实现模型共享。开发者可自行修改映射目录。
 
