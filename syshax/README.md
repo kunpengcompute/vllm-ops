@@ -111,6 +111,7 @@ git apply boostkit-vllm-ops-gpu-082.patch
 之后退出vllm_gpu容器，进入vllm_cpu容器，并从本仓库dev分支获取sysHAX cpu容器vllm源代码。
 
 ```bash
+yum install -y libomp #安装libomp依赖包
 git clone https://gitcode.com/boostkit/vllm-ops.git -b dev
 git apply boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
 git apply boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
@@ -125,17 +126,18 @@ VLLM_TARGET_DEVICE=cpu pip install -v .
 
 gpu容器：
 ```bash
-VLLM_USE_V1=0 taskset -c 36-39,76-79,116-119,156-159 vllm serve your_model   --host 0.0.0.0   --port 8001   --dtype=half   --swap_space=16  --block_size=16   --preemption_mode=swap   --max_model_len=4096   --tensor-parallel-size 1   --gpu_memory_utilization=0.95 --enable-auto-pd-offload    --enforce-eager --use_greedy
+VLLM_USE_V1=0 taskset -c 36-39,76-79,116-119,156-159 vllm serve /home/models/tclf90_deepseek-r1-distill-qwen-32b-gptq-int8/   --host 0.0.0.0   --port 8001   --dtype=half   --swap_space=16  --block_size=16   --preemption_mode=swap   --max_model_len=4096   --tensor-parallel-size 1   --gpu_memory_utilization=0.95 --enable-auto-pd-offload    --enforce-eager --use_greedy
 ```
 
 cpu容器：
 ```bash
-VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFINITY="0-31,40-71,80-111,120-151" SYSHAX_QUANTIZE=q4_0 vllm serve your_model     --host 0.0.0.0     --port 8002     --dtype=half     --block_size=16     --preemption_mode=swap     --max_model_len=8192     --enable-auto-pd-offload  --tensor-parallel-size 1 --use_greedy
+VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFINITY="0-31,40-71,80-111,120-151" SYSHAX_QUANTIZE=q4_0 vllm serve /home/models/tclf90_deepseek-r1-distill-qwen-32b-gptq-int8/     --host 0.0.0.0     --port 8002     --dtype=half     --block_size=16     --preemption_mode=swap     --max_model_len=8192     --enable-auto-pd-offload  --tensor-parallel-size 1 --use_greedy
 ```
 
-注：cpu侧不要使用所有的核心，预留部分核心供gpu调度及部分计算使用。
-
-sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md) 的源码部署模式进行部署。
+注：
+1、cpu侧不要使用所有的核心，预留部分核心供gpu调度及部分计算使用。
+2、/home/models/tclf90_deepseek-r1-distill-qwen-32b-gptq-int8/ 为模型存放路径，请替换成实际使用的模型及路径。
+3、sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md) 的源码部署模式进行部署，并参考指南中方式修改端口和并发量。
 
 ---
 
