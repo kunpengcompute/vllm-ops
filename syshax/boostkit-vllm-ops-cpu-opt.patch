@@ -173,7 +173,7 @@ index 0000000..432a76f
 +#include <arm_sve.h>
 +#include <arm_neon.h>
 +#include <ATen/ops/empty.h>
-+#include "paged_attn_utils.h"
++#include "paged_attention_utils.h"
 +#include "paged_attention.h"
 +
 +#define BLOCK_SIZE                                       16
@@ -397,7 +397,7 @@ index 0000000..e3992b8
 + * Create: 2025-10-24
 + */
 +
-+#include "paged_attn_utils.h"
++#include "paged_attention_utils.h"
 +
 +svfloat32_t FastExp(svbool_t pg, svfloat32_t values)
 +{
