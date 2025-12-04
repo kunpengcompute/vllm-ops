@@ -98,7 +98,7 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # q and kv proj aren't registered as submodules intentionally
             module.process_weights_after_loading()
             continue
-        quant_method = getattr(module, "quant_method", None)
+        quant_method = None
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters

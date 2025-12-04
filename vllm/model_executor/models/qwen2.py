@@ -562,6 +562,21 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         )
         loaded = loader.load_weights(weights)
         if inference_fused:
+            quant_method_gptq = (
+                getattr(self, 'quant_config', None) and 
+                getattr(self.quant_config, "quant_method", None) == "gptq"
+            )
+            config_quant_gptq = (
+                getattr(self, 'config', None) and 
+                getattr(self.config, 'quantization_config', None) and 
+                self.config.quantization_config.get("quant_method") == "gptq"
+            )
+            if quant_method_gptq or config_quant_gptq:
+                print("dequantize gptq")
+                convert_gptq_to_fp16(self.model)
+                self.quant_config=None
+                if hasattr(self.config, "quantization_config"):
+                    del self.config.quantization_config
             self._load_weight_to_cpp()
         return loaded
 
@@ -646,3 +661,119 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             None
         )
         self._cpp_weight_loaded = True
+
+def convert_gptq_to_fp16(model):
+    """
+    遍历模型所有层，把 GPTQ 量化权重转换成 FP16。
+    假设模型里已经 load 了 safetensors 中的 qweight/scales/qzeros/g_idx/bias。
+    """
+    print("Converting GPTQ weights to FP16...")
+
+
+    def unpack_qweight(qweight: torch.Tensor, bits: int = 8) -> torch.Tensor:
+        """
+        解包 GPTQ 打包的 int32 权重为 int8。
+        每个 int32 含 4 个 int8，展开后第一维扩展为 4 倍。
+        例如: [1280, 55296] -> [5120, 55296]
+        """
+        assert qweight.dtype == torch.int32, f"Expected int32, got {qweight.dtype}"
+
+        orig_shape = qweight.shape
+        
+        # 方法1：使用torch.view（最快最准确）
+        # try:
+        # 将int32重新解释为uint8
+        q_uint8 = qweight.view(torch.uint8)
+        q = q_uint8.reshape(orig_shape[0], orig_shape[1], 4)
+        # 重新排列并展开
+        q = q.permute(0, 2, 1).contiguous()
+        q = q.view(orig_shape[0] * 4, orig_shape[1])
+        return q
+
+    def unpack_qzeros(qzeros: torch.Tensor) -> torch.Tensor:
+        """
+        解包 GPTQ 打包的 qzeros，从 int32 -> int8。
+        例如 [40, 1792] -> [40, 7168]
+        """
+        assert qzeros.dtype == torch.int32
+        orig_shape = qzeros.shape
+        bytes = torch.stack([
+            (qzeros >> 0) & 0xFF,
+            (qzeros >> 8) & 0xFF,
+            (qzeros >> 16) & 0xFF,
+            (qzeros >> 24) & 0xFF,
+        ], dim=-1).to(torch.int8)
+        return bytes.view(orig_shape[0], orig_shape[1] * 4)
+    
+    def dequantize(qweight, scales, qzeros, g_idx, bits=8, group_size=128, debug=True):
+        """
+        将 GPTQ 格式的量化权重反量化为浮点数矩阵。
+        """
+        torch.set_num_threads(1) 
+        # 1️⃣ 解包 qweight 和 qzeros
+        # 解包
+        qzeros = unpack_qzeros(qzeros)   # [40, 55296]
+        qweight = unpack_qweight(qweight)  # [5120, 55296]
+
+        # block 参数
+        block_size = qweight.shape[0] // qzeros.shape[0]  # 5120 // 40 = 128
+        num_blocks = qzeros.shape[0]  # 40
+
+        # 创建结果矩阵
+        w_fp16 = torch.empty_like(qweight, dtype=torch.float32)
+
+        # 分块反量化
+        for block_idx in range(num_blocks):
+            start = block_idx * block_size
+            end = start + block_size
+
+            # 当前块的量化参数
+            scale_block = scales[block_idx, :].unsqueeze(0)   # [1, 55296]
+            zero_block = qzeros[block_idx, :].unsqueeze(0)    # [1, 55296]
+
+            # 对应块范围反量化
+            w_fp16[start:end, :] = (qweight[start:end, :].to(torch.int32) - zero_block.to(torch.int32) - 1) * scale_block
+
+        # 4️⃣ 转置以匹配线性层 [out_features, in_features]
+        return w_fp16.T.half()  # [7168, 5120]
+    
+    # 遍历模型所有模块
+    for name, module in model.named_modules():
+        
+        # 处理 self_attn 的 q/k/v/o_proj
+        for proj in ["q_proj", "k_proj", "v_proj","qkv_proj", "o_proj"]:
+            if hasattr(module, proj):
+                m = getattr(module, proj)
+                if all(hasattr(m, x) for x in ["qweight", "scales", "qzeros"]):
+                    g_idx = getattr(m, "g_idx", None)
+                    weight_fp16 = dequantize(m.qweight, m.scales, m.qzeros, g_idx,debug=True)
+                    m.weight = torch.nn.Parameter(weight_fp16)
+                    for attr in ["qweight", "scales", "qzeros", "g_idx"]:
+                        if hasattr(m, attr):
+                            delattr(m, attr)
+                    
+                
+
+        
+        # 处理 MLP 的 up/down/gate_proj
+        for proj in ["up_proj", "down_proj", "gate_proj", "gate_up_proj"]:
+            if hasattr(module, proj):
+                m = getattr(module, proj)
+                if all(hasattr(m, x) for x in ["qweight", "scales", "qzeros"]):
+                    g_idx = getattr(m, "g_idx", None)
+                    weight_fp16 = dequantize(m.qweight, m.scales, m.qzeros, g_idx,debug=True)
+                    m.weight = torch.nn.Parameter(weight_fp16)
+                    for attr in ["qweight", "scales", "qzeros", "g_idx"]:
+                        if hasattr(m, attr):
+                            delattr(m, attr)
+        # LayerNorm 层直接转 FP16
+        for ln_attr in ["input_layernorm", "post_attention_layernorm"]:
+            if hasattr(module, ln_attr):
+                ln = getattr(module, ln_attr)
+                if hasattr(ln, "weight"):
+                    ln.weight = ln.weight.half()
+                if hasattr(ln, "bias") and ln.bias is not None:
+                    ln.bias = ln.bias.half()
+    
+    print("Conversion to FP16 done!")
+
