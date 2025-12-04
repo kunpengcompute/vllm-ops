@@ -165,7 +165,6 @@ class SamplerOutput(
             f"sampled_token_ids={sampled_token_ids_repr}, "
             f"spec_decode_worker_metrics={self.spec_decode_worker_metrics})")
 
-
 class Sampler(nn.Module):
     """Samples the next tokens from the model's outputs.
 
@@ -247,14 +246,20 @@ class Sampler(nn.Module):
             logits: (num_tokens, vocab_size).
             sampling_metadata: Metadata for sampling.
         """
+        
+        # 设置并行数，防止并行开销过大
+        torch.set_num_threads(1) 
+
         assert logits is not None
         # 纯 Greedy 通道：当 temperature==0.0 且未请求任何 logprobs 时，跳过概率/softmax 开销
         params = sampling_metadata.seq_groups[0].sampling_params
         if params.temperature < 0.01 and params.logprobs is None and params.prompt_logprobs is None:
             # 获取每个序列组对应的行索引（decode 阶段一个组对应一行）
             sample_rows = sampling_metadata.categorized_sample_indices[SamplingType.GREEDY]
-            # 直接 argmax 获取 token id
-            greedy_ids = torch.argmax(logits[sample_rows], dim=-1)
+
+            # 替代argmax获取token id
+            _, greedy_ids = logits.index_select(0, sample_rows).max(dim=-1)
+
             outputs: List[CompletionSequenceGroupOutput] = []
             for i, seq_group in enumerate(sampling_metadata.seq_groups):
                 if seq_group.do_sample:
