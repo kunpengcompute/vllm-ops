@@ -33,6 +33,7 @@ typedef struct MultiNumaWorkRange {
 // 全局变量声明
 extern std::vector<int> cpu_ids;
 extern bool i8mm_flag;
+extern int nrc_value;
 
 // 字符串工具函数
 std::vector<std::string> split_str(const std::string& str, char delimiter);
@@ -48,6 +49,9 @@ void init_process_affinity();
 // i8mm指令集检测
 bool detect_i8mm_support();
 bool init_i8mm_flag();
+
+// NRC环境变量获取
+int get_nrc_value();
 
 // 工作分配函数
 void init_work_divider(WorkDivider* divider, int numas);

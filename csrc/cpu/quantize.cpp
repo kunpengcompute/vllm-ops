@@ -455,6 +455,146 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * __restrict__ s, size_t bs, const void
     const block_q8_0 * __restrict__ y = static_cast<const block_q8_0 *>(vy);
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+    if (nrc == 4) {
+        const block_q4_0 * __restrict__ vx0 = x;
+        const block_q4_0 * __restrict__ vx1 = (const block_q4_0 *) ((const uint8_t*)x + bx);
+        const block_q4_0 * __restrict__ vx2 = (const block_q4_0 *) ((const uint8_t*)x + 2*bx);
+        const block_q4_0 * __restrict__ vx3 = (const block_q4_0 *) ((const uint8_t*)x + 3*bx);
+
+        const block_q8_0 * __restrict__ vy0 = y;
+        const block_q8_0 * __restrict__ vy1 = (const block_q8_0 *) ((const uint8_t*)y + by);
+        const block_q8_0 * __restrict__ vy2 = (const block_q8_0 *) ((const uint8_t*)y + 2*by);
+        const block_q8_0 * __restrict__ vy3 = (const block_q8_0 *) ((const uint8_t*)y + 3*by);
+
+        float32x4_t sumv0 = vdupq_n_f32(0.0f);
+        float32x4_t sumv1 = vdupq_n_f32(0.0f);
+        float32x4_t sumv2 = vdupq_n_f32(0.0f);
+        float32x4_t sumv3 = vdupq_n_f32(0.0f);
+
+        for (int i = 0; i < nb; i++) {
+            const block_q4_0 * __restrict__ b_x0 = &vx0[i];
+            const block_q4_0 * __restrict__ b_x1 = &vx1[i];
+            const block_q4_0 * __restrict__ b_x2 = &vx2[i];
+            const block_q4_0 * __restrict__ b_x3 = &vx3[i];
+
+            const block_q8_0 * __restrict__ b_y0 = &vy0[i];
+            const block_q8_0 * __restrict__ b_y1 = &vy1[i];
+            const block_q8_0 * __restrict__ b_y2 = &vy2[i];
+            const block_q8_0 * __restrict__ b_y3 = &vy3[i];
+
+            const uint8x16_t m4b = vdupq_n_u8(0x0F);
+            const int8x16_t  s8b = vdupq_n_s8(0x8);
+
+            const uint8x16_t v0_0 = vld1q_u8(b_x0->qs);
+            const uint8x16_t v0_1 = vld1q_u8(b_x1->qs);
+            const uint8x16_t v0_2 = vld1q_u8(b_x2->qs);
+            const uint8x16_t v0_3 = vld1q_u8(b_x3->qs);
+
+            // 4-bit -> 8-bit
+            const int8x16_t v0_0l = vreinterpretq_s8_u8(vandq_u8  (v0_0, m4b));
+            const int8x16_t v0_0h = vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4));
+            const int8x16_t v0_1l = vreinterpretq_s8_u8(vandq_u8  (v0_1, m4b));
+            const int8x16_t v0_1h = vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4));
+            const int8x16_t v0_2l = vreinterpretq_s8_u8(vandq_u8  (v0_2, m4b));
+            const int8x16_t v0_2h = vreinterpretq_s8_u8(vshrq_n_u8(v0_2, 4));
+            const int8x16_t v0_3l = vreinterpretq_s8_u8(vandq_u8  (v0_3, m4b));
+            const int8x16_t v0_3h = vreinterpretq_s8_u8(vshrq_n_u8(v0_3, 4));
+
+            // sub 8
+            const int8x16_t x0_l = vsubq_s8(v0_0l, s8b);
+            const int8x16_t x0_h = vsubq_s8(v0_0h, s8b);
+            const int8x16_t x1_l = vsubq_s8(v0_1l, s8b);
+            const int8x16_t x1_h = vsubq_s8(v0_1h, s8b);
+            const int8x16_t x2_l = vsubq_s8(v0_2l, s8b);
+            const int8x16_t x2_h = vsubq_s8(v0_2h, s8b);
+            const int8x16_t x3_l = vsubq_s8(v0_3l, s8b);
+            const int8x16_t x3_h = vsubq_s8(v0_3h, s8b);
+
+            const int8x16_t y0_l = vld1q_s8(b_y0->qs);
+            const int8x16_t y0_h = vld1q_s8(b_y0->qs + 16);
+            const int8x16_t y1_l = vld1q_s8(b_y1->qs);
+            const int8x16_t y1_h = vld1q_s8(b_y1->qs + 16);
+            const int8x16_t y2_l = vld1q_s8(b_y2->qs);
+            const int8x16_t y2_h = vld1q_s8(b_y2->qs + 16);
+            const int8x16_t y3_l = vld1q_s8(b_y3->qs);
+            const int8x16_t y3_h = vld1q_s8(b_y3->qs + 16);
+
+            float32x4_t scale1 = {GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y0->d),
+                                  GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y1->d),
+                                  GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y0->d),
+                                  GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y1->d)};
+
+            float32x4_t scale2 = {GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y2->d),
+                                  GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y3->d),
+                                  GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y2->d),
+                                  GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y3->d)};
+
+            float32x4_t scale3 = {GGML_FP16_TO_FP32(b_x2->d)*GGML_FP16_TO_FP32(b_y0->d),
+                                  GGML_FP16_TO_FP32(b_x2->d)*GGML_FP16_TO_FP32(b_y1->d),
+                                  GGML_FP16_TO_FP32(b_x3->d)*GGML_FP16_TO_FP32(b_y0->d),
+                                  GGML_FP16_TO_FP32(b_x3->d)*GGML_FP16_TO_FP32(b_y1->d)};
+
+            float32x4_t scale4 = {GGML_FP16_TO_FP32(b_x2->d)*GGML_FP16_TO_FP32(b_y2->d),
+                                  GGML_FP16_TO_FP32(b_x2->d)*GGML_FP16_TO_FP32(b_y3->d),
+                                  GGML_FP16_TO_FP32(b_x3->d)*GGML_FP16_TO_FP32(b_y2->d),
+                                  GGML_FP16_TO_FP32(b_x3->d)*GGML_FP16_TO_FP32(b_y3->d)};
+
+            int8x16_t l0 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
+            int8x16_t l1 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
+
+            int8x16_t l2 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x0_h), vreinterpretq_s64_s8(x1_h)));
+            int8x16_t l3 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x0_h), vreinterpretq_s64_s8(x1_h)));
+
+            int8x16_t l4 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x2_l), vreinterpretq_s64_s8(x3_l)));
+            int8x16_t l5 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x2_l), vreinterpretq_s64_s8(x3_l)));
+
+            int8x16_t l6 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x2_h), vreinterpretq_s64_s8(x3_h)));
+            int8x16_t l7 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x2_h), vreinterpretq_s64_s8(x3_h)));
+
+            int8x16_t r0 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y0_l), vreinterpretq_s64_s8(y1_l)));
+            int8x16_t r1 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y0_l), vreinterpretq_s64_s8(y1_l)));
+
+            int8x16_t r2 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y0_h), vreinterpretq_s64_s8(y1_h)));
+            int8x16_t r3 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y0_h), vreinterpretq_s64_s8(y1_h)));
+
+            int8x16_t r4 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y2_l), vreinterpretq_s64_s8(y3_l)));
+            int8x16_t r5 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y2_l), vreinterpretq_s64_s8(y3_l)));
+
+            int8x16_t r6 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y2_h), vreinterpretq_s64_s8(y3_h)));
+            int8x16_t r7 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y2_h), vreinterpretq_s64_s8(y3_h)));
+
+            sumv0 = vmlaq_f32(sumv0,(vcvtq_f32_s32(vmmlaq_s32((vmmlaq_s32((vmmlaq_s32((vmmlaq_s32(vdupq_n_s32(0), l0, r0)),
+                                                                                l1, r1)), l2, r2)), l3, r3))), scale1);
+            
+            sumv1 = vmlaq_f32(sumv1,(vcvtq_f32_s32(vmmlaq_s32((vmmlaq_s32((vmmlaq_s32((vmmlaq_s32(vdupq_n_s32(0), l0, r4)),
+                                                                                l1, r5)), l2, r6)), l3, r7))), scale2);
+
+            sumv2 = vmlaq_f32(sumv2,(vcvtq_f32_s32(vmmlaq_s32((vmmlaq_s32((vmmlaq_s32((vmmlaq_s32(vdupq_n_s32(0), l4, r0)),
+                                                                                l5, r1)), l6, r2)), l7, r3))), scale3);
+
+            sumv3 = vmlaq_f32(sumv3,(vcvtq_f32_s32(vmmlaq_s32((vmmlaq_s32((vmmlaq_s32((vmmlaq_s32(vdupq_n_s32(0), l4, r4)),
+                                                                                l5, r5)), l6, r6)), l7, r7))), scale4);
+            
+        }
+
+        // case 2
+        float32x4_t t0 = vzip1q_f32(sumv0, sumv2); // [x0·y0, x2·y0, x0·y1, x2·y1]
+        float32x4_t t1 = vzip2q_f32(sumv0, sumv2); // [x1·y0, x3·y0, x1·y1, x3·y1]
+        float32x4_t t2 = vzip1q_f32(sumv1, sumv3); // [x0·y2, x2·y2, x0·y3, x2·y3]
+        float32x4_t t3 = vzip2q_f32(sumv1, sumv3); // [x1·y2, x3·y2, x1·y3, x3·y3]
+
+        float32x4_t col0 = vzip1q_f32(t0, t1);     // [x0·y0, x1·y0, x2·y0, x3·y0]
+        float32x4_t col1 = vzip2q_f32(t0, t1);     // [x0·y1, x1·y1, x2·y1, x3·y1]
+        float32x4_t col2 = vzip1q_f32(t2, t3);     // [x0·y2, x1·y2, x2·y2, x3·y2]
+        float32x4_t col3 = vzip2q_f32(t2, t3);     // [x0·y3, x1·y3, x2·y3, x3·y3]
+
+        vst1q_f32(s, col0);              // 第0列：所有x与y0的点积
+        vst1q_f32(s + bs, col1);         // 第1列：所有x与y1的点积  
+        vst1q_f32(s + 2 * bs, col2);     // 第2列：所有x与y2的点积
+        vst1q_f32(s + 3 * bs, col3);     // 第3列：所有x与y3的点积
+        return;
+    }
+
     if (nrc == 2) {
         const block_q4_0 * __restrict__ vx0 = x;
         const block_q4_0 * __restrict__ vx1 = (const block_q4_0 *) ((const uint8_t*)x + bx);
@@ -463,15 +603,21 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * __restrict__ s, size_t bs, const void
         const block_q8_0 * __restrict__ vy1 = (const block_q8_0 *) ((const uint8_t*)y + by);
 
         float32x4_t sumv0 = vdupq_n_f32(0.0f);
+        const int PREF_DIST_X = 16;
+        const int PREF_DIST_Y = 12;
+        int i;
+        const uint8x16_t m4b = vdupq_n_u8(0x0F);
+        const int8x16_t  s8b = vdupq_n_s8(0x8);
+        for (i = 0; i < nb - PREF_DIST_X; i++) {
+            __builtin_prefetch((char*)&vx0[i + PREF_DIST_X], 0, 0);
+            __builtin_prefetch((char*)&vx1[i + PREF_DIST_X], 0, 0);
 
-        for (int i = 0; i < nb; i++) {
+            __builtin_prefetch((char*)&vy0[i + PREF_DIST_Y], 0, 0);
+            __builtin_prefetch((char*)&vy1[i + PREF_DIST_Y], 0, 0);
             const block_q4_0 * __restrict__ b_x0 = &vx0[i];
             const block_q4_0 * __restrict__ b_x1 = &vx1[i];
             const block_q8_0 * __restrict__ b_y0 = &vy0[i];
             const block_q8_0 * __restrict__ b_y1 = &vy1[i];
-
-            const uint8x16_t m4b = vdupq_n_u8(0x0F);
-            const int8x16_t  s8b = vdupq_n_s8(0x8);
 
             const uint8x16_t v0_0 = vld1q_u8(b_x0->qs);
             const uint8x16_t v0_1 = vld1q_u8(b_x1->qs);
@@ -494,10 +640,77 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * __restrict__ s, size_t bs, const void
             const int8x16_t y1_l = vld1q_s8(b_y1->qs);
             const int8x16_t y1_h = vld1q_s8(b_y1->qs + 16);
 
-            float32x4_t scale = {GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y0->d),
-                                 GGML_FP16_TO_FP32(b_x0->d)*GGML_FP16_TO_FP32(b_y1->d),
-                                 GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y0->d),
-                                 GGML_FP16_TO_FP32(b_x1->d)*GGML_FP16_TO_FP32(b_y1->d)};
+            float32x4_t x_fp32 = {
+                GGML_FP16_TO_FP32(b_x0->d),
+                GGML_FP16_TO_FP32(b_x0->d),
+                GGML_FP16_TO_FP32(b_x1->d),
+                GGML_FP16_TO_FP32(b_x1->d)
+            };
+            float32x4_t y_fp32 = {
+                GGML_FP16_TO_FP32(b_y0->d),
+                GGML_FP16_TO_FP32(b_y1->d),
+                GGML_FP16_TO_FP32(b_y0->d),
+                GGML_FP16_TO_FP32(b_y1->d)
+            };
+            float32x4_t scale =  vmulq_f32(x_fp32, y_fp32);
+
+
+            int8x16_t l0 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
+            int8x16_t l1 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
+
+            int8x16_t l2 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x0_h), vreinterpretq_s64_s8(x1_h)));
+            int8x16_t l3 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x0_h), vreinterpretq_s64_s8(x1_h)));
+
+            int8x16_t r0 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y0_l), vreinterpretq_s64_s8(y1_l)));
+            int8x16_t r1 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y0_l), vreinterpretq_s64_s8(y1_l)));
+
+            int8x16_t r2 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(y0_h), vreinterpretq_s64_s8(y1_h)));
+            int8x16_t r3 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(y0_h), vreinterpretq_s64_s8(y1_h)));
+
+            sumv0 = vmlaq_f32(sumv0,(vcvtq_f32_s32(vmmlaq_s32((vmmlaq_s32((vmmlaq_s32((vmmlaq_s32(vdupq_n_s32(0), l0, r0)),
+                                                                                l1, r1)), l2, r2)), l3, r3))), scale);
+        }
+        for (; i < nb; i++) {            
+            const block_q4_0 * __restrict__ b_x0 = &vx0[i];
+            const block_q4_0 * __restrict__ b_x1 = &vx1[i];
+            const block_q8_0 * __restrict__ b_y0 = &vy0[i];
+            const block_q8_0 * __restrict__ b_y1 = &vy1[i];
+
+            const uint8x16_t v0_0 = vld1q_u8(b_x0->qs);
+            const uint8x16_t v0_1 = vld1q_u8(b_x1->qs);
+
+            // 4-bit -> 8-bit
+            const int8x16_t v0_0l = vreinterpretq_s8_u8(vandq_u8  (v0_0, m4b));
+            const int8x16_t v0_0h = vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4));
+            const int8x16_t v0_1l = vreinterpretq_s8_u8(vandq_u8  (v0_1, m4b));
+            const int8x16_t v0_1h = vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4));
+
+            // sub 8
+            const int8x16_t x0_l = vsubq_s8(v0_0l, s8b);
+            const int8x16_t x0_h = vsubq_s8(v0_0h, s8b);
+            const int8x16_t x1_l = vsubq_s8(v0_1l, s8b);
+            const int8x16_t x1_h = vsubq_s8(v0_1h, s8b);
+
+            // load y
+            const int8x16_t y0_l = vld1q_s8(b_y0->qs);
+            const int8x16_t y0_h = vld1q_s8(b_y0->qs + 16);
+            const int8x16_t y1_l = vld1q_s8(b_y1->qs);
+            const int8x16_t y1_h = vld1q_s8(b_y1->qs + 16);
+
+            float32x4_t x_fp32 = {
+                GGML_FP16_TO_FP32(b_x0->d),
+                GGML_FP16_TO_FP32(b_x0->d),
+                GGML_FP16_TO_FP32(b_x1->d),
+                GGML_FP16_TO_FP32(b_x1->d)
+            };
+            float32x4_t y_fp32 = {
+                GGML_FP16_TO_FP32(b_y0->d),
+                GGML_FP16_TO_FP32(b_y1->d),
+                GGML_FP16_TO_FP32(b_y0->d),
+                GGML_FP16_TO_FP32(b_y1->d)
+            };
+            float32x4_t scale =  vmulq_f32(x_fp32, y_fp32);
+
 
             int8x16_t l0 = vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
             int8x16_t l1 = vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(x0_l), vreinterpretq_s64_s8(x1_l)));
@@ -523,7 +736,52 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * __restrict__ s, size_t bs, const void
     }
 #endif
 
-#if defined(__ARM_FEATURE_SVE)
+
+#if defined(__ARM_NEON)
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+
+    for (int i = 0; i < nb; i += 2) {
+        const block_q4_0 * __restrict__ x0 = &x[i + 0];
+        const block_q4_0 * __restrict__ x1 = &x[i + 1];
+        const block_q8_0 * __restrict__ y0 = &y[i + 0];
+        const block_q8_0 * __restrict__ y1 = &y[i + 1];
+
+        const uint8x16_t m4b = vdupq_n_u8(0x0F);
+        const int8x16_t  s8b = vdupq_n_s8(0x8);
+
+        const uint8x16_t v0_0 = vld1q_u8(x0->qs);
+        const uint8x16_t v0_1 = vld1q_u8(x1->qs);
+
+        // 4-bit -> 8-bit
+        const int8x16_t v0_0l = vreinterpretq_s8_u8(vandq_u8  (v0_0, m4b));
+        const int8x16_t v0_0h = vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4));
+        const int8x16_t v0_1l = vreinterpretq_s8_u8(vandq_u8  (v0_1, m4b));
+        const int8x16_t v0_1h = vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4));
+
+        // sub 8
+        const int8x16_t v0_0ls = vsubq_s8(v0_0l, s8b);
+        const int8x16_t v0_0hs = vsubq_s8(v0_0h, s8b);
+        const int8x16_t v0_1ls = vsubq_s8(v0_1l, s8b);
+        const int8x16_t v0_1hs = vsubq_s8(v0_1h, s8b);
+
+        // load y
+        const int8x16_t v1_0l = vld1q_s8(y0->qs);
+        const int8x16_t v1_0h = vld1q_s8(y0->qs + 16);
+        const int8x16_t v1_1l = vld1q_s8(y1->qs);
+        const int8x16_t v1_1h = vld1q_s8(y1->qs + 16);
+
+        // dot product into int32x4_t
+        const int32x4_t p_0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), v0_0ls, v1_0l), v0_0hs, v1_0h);
+        const int32x4_t p_1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), v0_1ls, v1_1l), v0_1hs, v1_1h);
+
+        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), GGML_FP16_TO_FP32(x0->d)*GGML_FP16_TO_FP32(y0->d));
+        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), GGML_FP16_TO_FP32(x1->d)*GGML_FP16_TO_FP32(y1->d));
+    }
+
+    *s = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+#elif defined(__ARM_FEATURE_SVE)
     float sum[4] = {0.0};
     int64_t x0_sum, x1_sum, x0_sum_1, x1_sum_1;
     svbool_t pre = svptrue_b8();
@@ -585,49 +843,6 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * __restrict__ s, size_t bs, const void
         sum[3] += x1_sum_1 * x3->d * y3->d;
     }
     *s = sum[0] + sum[1] + sum[2] + sum[3];
-#elif defined(__ARM_NEON)
-    float32x4_t sumv0 = vdupq_n_f32(0.0f);
-    float32x4_t sumv1 = vdupq_n_f32(0.0f);
-
-    for (int i = 0; i < nb; i += 2) {
-        const block_q4_0 * __restrict__ x0 = &x[i + 0];
-        const block_q4_0 * __restrict__ x1 = &x[i + 1];
-        const block_q8_0 * __restrict__ y0 = &y[i + 0];
-        const block_q8_0 * __restrict__ y1 = &y[i + 1];
-
-        const uint8x16_t m4b = vdupq_n_u8(0x0F);
-        const int8x16_t  s8b = vdupq_n_s8(0x8);
-
-        const uint8x16_t v0_0 = vld1q_u8(x0->qs);
-        const uint8x16_t v0_1 = vld1q_u8(x1->qs);
-
-        // 4-bit -> 8-bit
-        const int8x16_t v0_0l = vreinterpretq_s8_u8(vandq_u8  (v0_0, m4b));
-        const int8x16_t v0_0h = vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4));
-        const int8x16_t v0_1l = vreinterpretq_s8_u8(vandq_u8  (v0_1, m4b));
-        const int8x16_t v0_1h = vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4));
-
-        // sub 8
-        const int8x16_t v0_0ls = vsubq_s8(v0_0l, s8b);
-        const int8x16_t v0_0hs = vsubq_s8(v0_0h, s8b);
-        const int8x16_t v0_1ls = vsubq_s8(v0_1l, s8b);
-        const int8x16_t v0_1hs = vsubq_s8(v0_1h, s8b);
-
-        // load y
-        const int8x16_t v1_0l = vld1q_s8(y0->qs);
-        const int8x16_t v1_0h = vld1q_s8(y0->qs + 16);
-        const int8x16_t v1_1l = vld1q_s8(y1->qs);
-        const int8x16_t v1_1h = vld1q_s8(y1->qs + 16);
-
-        // dot product into int32x4_t
-        const int32x4_t p_0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), v0_0ls, v1_0l), v0_0hs, v1_0h);
-        const int32x4_t p_1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), v0_1ls, v1_1l), v0_1hs, v1_1h);
-
-        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), GGML_FP16_TO_FP32(x0->d)*GGML_FP16_TO_FP32(y0->d));
-        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), GGML_FP16_TO_FP32(x1->d)*GGML_FP16_TO_FP32(y1->d));
-    }
-
-    *s = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
 #else
     // scalar
     float sumf = 0.0;
@@ -724,7 +939,38 @@ void ggml_vec_dot_q8_0_q8_0(int n, float *__restrict__ s, size_t bs, const void 
     int ib = 0;
     float sumf = 0;
 
-#if defined(__ARM_FEATURE_SVE)
+#if defined(__ARM_NEON)
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+
+    for (; ib + 1 < nb; ib += 2) {
+        const block_q8_0 *__restrict__ x0 = &x[ib + 0];
+        const block_q8_0 *__restrict__ x1 = &x[ib + 1];
+        const block_q8_0 *__restrict__ y0 = &y[ib + 0];
+        const block_q8_0 *__restrict__ y1 = &y[ib + 1];
+
+        const int8x16_t x0_0 = vld1q_s8(x0->qs);
+        const int8x16_t x0_1 = vld1q_s8(x0->qs + 16);
+        const int8x16_t x1_0 = vld1q_s8(x1->qs);
+        const int8x16_t x1_1 = vld1q_s8(x1->qs + 16);
+
+        // load y
+        const int8x16_t y0_0 = vld1q_s8(y0->qs);
+        const int8x16_t y0_1 = vld1q_s8(y0->qs + 16);
+        const int8x16_t y1_0 = vld1q_s8(y1->qs);
+        const int8x16_t y1_1 = vld1q_s8(y1->qs + 16);
+
+        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(vaddq_s32(
+                        vdotq_s32(vdupq_n_s32(0), x0_0, y0_0),
+                        vdotq_s32(vdupq_n_s32(0), x0_1, y0_1))), GGML_FP16_TO_FP32(x0->d)*GGML_FP16_TO_FP32(y0->d));
+
+        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(vaddq_s32(
+                        vdotq_s32(vdupq_n_s32(0), x1_0, y1_0),
+                        vdotq_s32(vdupq_n_s32(0), x1_1, y1_1))), GGML_FP16_TO_FP32(x1->d)*GGML_FP16_TO_FP32(y1->d));
+    }
+
+    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+#elif defined(__ARM_FEATURE_SVE)
     svfloat32_t sumv0 = svdup_n_f32(0.0f);
     svfloat32_t sumv1 = svdup_n_f32(0.0f);
 
@@ -844,37 +1090,6 @@ void ggml_vec_dot_q8_0_q8_0(int n, float *__restrict__ s, size_t bs, const void 
             assert(false && "Unsupported vector length");
             break;
     }
-#elif defined(__ARM_NEON)
-    float32x4_t sumv0 = vdupq_n_f32(0.0f);
-    float32x4_t sumv1 = vdupq_n_f32(0.0f);
-
-    for (; ib + 1 < nb; ib += 2) {
-        const block_q8_0 *__restrict__ x0 = &x[ib + 0];
-        const block_q8_0 *__restrict__ x1 = &x[ib + 1];
-        const block_q8_0 *__restrict__ y0 = &y[ib + 0];
-        const block_q8_0 *__restrict__ y1 = &y[ib + 1];
-
-        const int8x16_t x0_0 = vld1q_s8(x0->qs);
-        const int8x16_t x0_1 = vld1q_s8(x0->qs + 16);
-        const int8x16_t x1_0 = vld1q_s8(x1->qs);
-        const int8x16_t x1_1 = vld1q_s8(x1->qs + 16);
-
-        // load y
-        const int8x16_t y0_0 = vld1q_s8(y0->qs);
-        const int8x16_t y0_1 = vld1q_s8(y0->qs + 16);
-        const int8x16_t y1_0 = vld1q_s8(y1->qs);
-        const int8x16_t y1_1 = vld1q_s8(y1->qs + 16);
-
-        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(vaddq_s32(
-                        vdotq_s32(vdupq_n_s32(0), x0_0, y0_0),
-                        vdotq_s32(vdupq_n_s32(0), x0_1, y0_1))), GGML_FP16_TO_FP32(x0->d)*GGML_FP16_TO_FP32(y0->d));
-
-        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(vaddq_s32(
-                        vdotq_s32(vdupq_n_s32(0), x1_0, y1_0),
-                        vdotq_s32(vdupq_n_s32(0), x1_1, y1_1))), GGML_FP16_TO_FP32(x1->d)*GGML_FP16_TO_FP32(y1->d));
-    }
-
-    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
 #else
     /* 不加速 */
     for (; ib < nb; ++ib) {
