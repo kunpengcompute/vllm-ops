@@ -39,6 +39,8 @@ else()
         "-fopenmp"
         "-DVLLM_CPU_EXTENSION")
 endif()
+message("使用libomp")
+list(APPEND LIBS omp)
 
 if (NOT MACOSX_FOUND)
     execute_process(COMMAND cat /proc/cpuinfo
@@ -79,6 +81,7 @@ else()
     find_isa(${CPUINFO} "POWER10" POWER10_FOUND)
     find_isa(${CPUINFO} "POWER9" POWER9_FOUND)
     find_isa(${CPUINFO} "asimd" ASIMD_FOUND) # Check for ARM NEON support
+    find_isa(${CPUINFO} "sve" SVE_FOUND) # Check for ARM NEON support
     find_isa(${CPUINFO} "bf16" ARM_BF16_FOUND) # Check for ARM BF16 support
     find_isa(${CPUINFO} "i8mm" ARM_I8MM_FOUND) # Check for ARM I8MM support
     find_isa(${CPUINFO} "S390" S390_FOUND)
@@ -123,25 +126,46 @@ elseif (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
 
 elseif (ASIMD_FOUND)
     message(STATUS "ARMv8 or later architecture detected")
-    if(ARM_BF16_FOUND AND ARM_I8MM_FOUND)
-        message(STATUS "BF16 and I8MM extension detected")
-        set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16+i8mm")
-        add_compile_definitions(ARM_BF16_SUPPORT)
-        add_compile_definitions(ARM_I8MM_SUPPORT)
-        add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
-    elseif(ARM_BF16_FOUND)
-        message(STATUS "BF16 extension detected")
-        set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16")
-        add_compile_definitions(ARM_BF16_SUPPORT)
-    elseif(ARM_I8MM_FOUND)
-        message(STATUS "I8MM extension detected")
-        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16+i8mm")
-        add_compile_definitions(ARM_I8MM_SUPPORT)
-        add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
-    else()
-        message(WARNING "BF16 and I8MM functionality is not available")
-        set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16") 
+    if(SVE_FOUND)
+        message(STATUS "SVE extension detected")
+        if(ARM_BF16_FOUND AND ARM_I8MM_FOUND)
+            message(STATUS "BF16 and I8MM extension detected")
+            set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16+i8mm+sve")
+            add_compile_definitions(ARM_BF16_SUPPORT)
+            add_compile_definitions(ARM_I8MM_SUPPORT)
+            add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+        elseif(ARM_BF16_FOUND)
+            message(STATUS "BF16 extension detected")
+            set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16+sve")
+            add_compile_definitions(ARM_BF16_SUPPORT)
+        elseif(ARM_I8MM_FOUND)
+            message(STATUS "I8MM extension detected")
+            set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16+i8mm+sve")
+            add_compile_definitions(ARM_I8MM_SUPPORT)
+            add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+        else()
+            message(WARNING "BF16 and I8MM functionality is not available")
+            set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16+sve") 
+        endif()
+    else() # SVE not found
+        message(STATUS "SVE extension not found, using non-SVE flags")
+        if(ARM_BF16_FOUND AND ARM_I8MM_FOUND)
+            set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16+i8mm")
+            add_compile_definitions(ARM_BF16_SUPPORT)
+            add_compile_definitions(ARM_I8MM_SUPPORT)
+            add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+        elseif(ARM_BF16_FOUND)
+            set(MARCH_FLAGS "-march=armv8.2-a+bf16+dotprod+fp16")
+            add_compile_definitions(ARM_BF16_SUPPORT)
+        elseif(ARM_I8MM_FOUND)
+            set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16+i8mm")
+            add_compile_definitions(ARM_I8MM_SUPPORT)
+            add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+        else()
+            set(MARCH_FLAGS "-march=armv8.2-a+dotprod+fp16") 
+        endif()
     endif()
+
     list(APPEND CXX_COMPILE_FLAGS ${MARCH_FLAGS} "-fpermissive"
         "-O3" "-funroll-loops" "-fomit-frame-pointer"
         "-ffast-math" "-finline-functions" "-fno-math-errno"
@@ -239,7 +263,10 @@ set(VLLM_EXT_SRC
     "csrc/cpu/sysHAX_ops.cpp"
     "csrc/cpu/torch_bindings.cpp"
     "csrc/cpu/quantize.cpp"
-    "csrc/cpu/cpu_utils.cpp")
+    "csrc/cpu/cpu_utils.cpp"
+    "csrc/cpu/paged_attention.cpp"
+    "csrc/cpu/paged_attention_utils.cpp"
+)
 
 if (AVX512_FOUND AND NOT AVX512_DISABLED)
     set(VLLM_EXT_SRC

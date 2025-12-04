@@ -1,0 +1,15 @@
+template<class scalar_t>
+void paged_attention_v1_impl(scalar_t* __restrict__ out,  
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k_cache,
+    const scalar_t* __restrict__ v_cache,
+    const int num_kv_heads,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int max_num_blocks_per_seq,
+    const int q_stride,
+    const int kv_block_stride,
+    const int kv_head_stride,
+    const int num_seqs,
+    const int num_heads,
+    const int head_size);

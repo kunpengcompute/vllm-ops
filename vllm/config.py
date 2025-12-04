@@ -895,21 +895,6 @@ class ModelConfig:
                 method = get_quantization_config(name)
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization)
-                if quantization_override is not None:
-                    # Raise error if the override is not custom (custom would
-                    # be in QUANTIZATION_METHODS but not QuantizationMethods)
-                    # and hasn't been added to the overrides list.
-                    if (name in get_args(QuantizationMethods)
-                            and name not in overrides):
-                        raise ValueError(
-                            f"Quantization method {name} is an override but "
-                            "is has not been added to the `overrides` list "
-                            "above. This is necessary to ensure that the "
-                            "overrides are checked in order of preference.")
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
-
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method

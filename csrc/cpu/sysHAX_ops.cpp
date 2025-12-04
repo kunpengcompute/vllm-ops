@@ -12,6 +12,7 @@
 #include "cpu_types.hpp"
 #include "quantize.h"
 #include "cpu_utils.h"
+#include "paged_attention.h"
 
 typedef unsigned int UINT32;
 typedef unsigned long long UINT64;
@@ -295,7 +296,7 @@ void prefill_attention(f16 *out_ptr, const f16 *qkv_ptr, const f16 *vt_ptr, int 
 
     get_total_thread_num();
 
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2)
     for (int seq = 0; seq < N_seqs; seq++) {
         for (int h_q = 0; h_q < num_attention_heads; h_q++) {
             f16 *qk_tmp = (f16 *)qk_tmp_storage;
@@ -330,142 +331,6 @@ void prefill_attention(f16 *out_ptr, const f16 *qkv_ptr, const f16 *vt_ptr, int 
             }
         }
     }
-}
-
-template<class scalar_t>
-void paged_attention_v1_impl(      scalar_t* __restrict__ out,            // [num_seqs, num_heads, head_size]
-      const scalar_t* __restrict__ q,        // [num_seqs, num_heads, head_size]
-      const scalar_t* __restrict__ k_cache,  // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-      const scalar_t* __restrict__ v_cache,  // [num_blocks, num_kv_heads, head_size, block_size]
-      const int num_kv_heads,
-      const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
-      const int* __restrict__ seq_lens,      // [num_seqs]
-      const int max_num_blocks_per_seq,
-      const int q_stride, const int kv_block_stride, const int kv_head_stride,
-      const int num_seqs, const int num_heads, const int HEAD_SIZE)
-{
-    using q_load_vec_t = typename KernelVecType<scalar_t>::q_load_vec_t;
-    using k_load_vec_t = typename KernelVecType<scalar_t>::k_load_vec_t;
-    using v_load_vec_t = typename KernelVecType<scalar_t>::v_load_vec_t;
-    using q_k_v_vec_t = typename KernelVecType<scalar_t>::q_k_v_vec_t;
-    using accum_vec_t = typename KernelVecType<scalar_t>::accum_vec_t;
-    using accum_scalar_t = scalar_t;
-
-    constexpr int BLOCK_SIZE = 16;
-    constexpr int x = BLOCK_SIZE / sizeof(scalar_t);
-    static_assert(k_load_vec_t::get_elem_num() % x == 0);
-    static_assert(q_load_vec_t::get_elem_num() * sizeof(scalar_t) == 16);
-
-    constexpr int TOKEN_PER_GROUP = k_load_vec_t::get_elem_num() / x;
-    constexpr int MAX_GROUP_NUM = 16 / TOKEN_PER_GROUP;
-    static_assert(MAX_GROUP_NUM == 8 || MAX_GROUP_NUM == 4);
-
-    const int N_gqa = num_heads / num_kv_heads;
-
-    get_total_thread_num();
-
-#pragma omp parallel for collapse(2) schedule(dynamic, 1)
-    for (int seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
-      for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
-        accum_scalar_t *qk_tmp = (accum_scalar_t *)qk_tmp_storage;
-        int seq_len = seq_lens[seq_idx];
-        const int* seq_block_table = block_tables + max_num_blocks_per_seq * seq_idx;
-        const int block_num = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        const int64_t kv_head_idx = head_idx / N_gqa;
-        const int last_block_token_num = seq_len - (block_num - 1) * BLOCK_SIZE;
-        const scalar_t* __restrict__ q_vec_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-
-        // Compute logits
-        for (int block_idx = 0; block_idx < block_num; ++block_idx) {
-            const int64_t physical_block_idx = seq_block_table[block_idx];
-            const scalar_t* __restrict__ k_block_cache_ptr =
-                k_cache + physical_block_idx * kv_block_stride +
-                kv_head_idx * kv_head_stride;
-            const int token_num = (block_idx == block_num - 1) ? last_block_token_num : BLOCK_SIZE;
-            const int group_num = (token_num + TOKEN_PER_GROUP - 1) / TOKEN_PER_GROUP;
-            accum_vec_t group_accums[MAX_GROUP_NUM];
-            for (int q_offset = 0; q_offset < HEAD_SIZE; q_offset +=x, k_block_cache_ptr += x * BLOCK_SIZE) {
-                q_load_vec_t q_load_group_vec(q_vec_ptr + q_offset);
-                q_k_v_vec_t q_group_vec(q_load_group_vec);
-
-                for (int token_group_idx = 0; token_group_idx < group_num; token_group_idx++) {
-                    k_load_vec_t k_load_group_vec(k_block_cache_ptr + token_group_idx * x * TOKEN_PER_GROUP);
-                    q_k_v_vec_t k_group_vec(k_load_group_vec);
-                    vec_op::fma(group_accums[token_group_idx], q_group_vec, k_group_vec);
-                    vec_op::prefetch(k_block_cache_ptr + x *BLOCK_SIZE + token_group_idx * x *TOKEN_PER_GROUP);
-                }
-            }
-            for (int token_group_idx = 0; token_group_idx < group_num; token_group_idx++) {
-                for (int token_idx = 0; token_idx < TOKEN_PER_GROUP; token_idx++) {
-                    accum_scalar_t dot_v =
-                        group_accums[token_group_idx].
-                        template reduce_sub_sum<accum_vec_t::get_elem_num() / TOKEN_PER_GROUP>(token_idx);
-                    qk_tmp[block_idx * BLOCK_SIZE + token_group_idx * TOKEN_PER_GROUP + token_idx] = dot_v;
-                }
-            }
-        }
-
-        f32 max = qk_tmp[0], sum = 0.0;
-        for (int i = 1; i < seq_len; i++) {
-            max = max >= qk_tmp[i] ? max : qk_tmp[i];
-        }
-
-        for (int i = 0; i < seq_len; i++) {
-            f16 diff = qk_tmp[i] - max;
-            qk_tmp[i] = expf_f16_table[*(uint16_t *)&diff];
-            sum += qk_tmp[i];
-        }
-        int i = 0;
-        for (; i < seq_len; i++) {
-            qk_tmp[i] /= sum;
-        }
-        for (; i < block_num * BLOCK_SIZE; i++) {
-            qk_tmp[i] = 0;
-        }
-
-        constexpr int head_elem_num_per_partition = 16;
-        assert(HEAD_SIZE % head_elem_num_per_partition == 0);
-        int head_partition_num = HEAD_SIZE / head_elem_num_per_partition;
-        for (int head_part_idx = 0; head_part_idx < head_partition_num; ++head_part_idx) {
-          accum_vec_t accums[head_elem_num_per_partition];
-          scalar_t* __restrict__ out_ptr =
-              out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE +
-              head_part_idx * head_elem_num_per_partition;
-          for (int block_idx = 0; block_idx < block_num; ++block_idx) {
-            const int64_t physical_block_idx = seq_block_table[block_idx];
-            const scalar_t* __restrict__ v_block_cache_ptr =
-                v_cache + physical_block_idx * kv_block_stride +
-                kv_head_idx * kv_head_stride + BLOCK_SIZE * head_part_idx *
-                head_elem_num_per_partition;
-
-                accum_vec_t qk_vec(qk_tmp + block_idx * BLOCK_SIZE);
-                for (int head_elem_idx = 0; head_elem_idx < head_elem_num_per_partition; head_elem_idx++) {
-                    v_load_vec_t v_load_vec(v_block_cache_ptr + BLOCK_SIZE * head_elem_idx);
-                    accum_vec_t v_vec(v_load_vec);
-                    vec_op::fma(accums[head_elem_idx], qk_vec, v_vec);
-                }
-
-                if (block_idx != block_num - 1) {
-                  const int64_t next_physical_block_idx =
-                      seq_block_table[block_idx + 1];
-                  const scalar_t* __restrict__ next_v_block_cache_ptr =
-                      v_cache + next_physical_block_idx * kv_block_stride +
-                      kv_head_idx * kv_head_stride +
-                      BLOCK_SIZE * head_part_idx * head_elem_num_per_partition;
-
-                  for (int head_elem_idx = 0; head_elem_idx < head_elem_num_per_partition; head_elem_idx += 2) {
-                      vec_op::prefetch(next_v_block_cache_ptr + BLOCK_SIZE * head_elem_idx);
-                  }
-                }
-          }
-
-          for (int head_elem_idx = 0; head_elem_idx < head_elem_num_per_partition; head_elem_idx++) {
-              float value = accums[head_elem_idx].reduce_sum();
-              vec_op::storeFP32(value, out_ptr + head_elem_idx);
-          }
-      }
-    }
-  }
 }
 
 void Quantize(void *Dst, float *src, enum ggml_type DataType, int size)
@@ -705,6 +570,9 @@ void gate_up_proj_matrix_multiply_with_numa(
     const int input_stride = k / dstBlockNum * dstBlocksize;
     const int output_stride = 2 * n;
     
+    // 获取NRC值
+    const int nrc = get_nrc_value();
+    
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     const bool use_i8mm_optimization = (srcType == GGML_TYPE_Q4_0 || srcType == GGML_TYPE_Q8_0);
 #else
@@ -729,57 +597,219 @@ void gate_up_proj_matrix_multiply_with_numa(
         }
     }
     else {
-        // i8mm优化模式：块处理
+        // i8mm优化模式：根据nrc值选择不同的块处理策略
         const int i_end = mrange.end_thread;
+        int i = mrange.begin_thread;
         
-        for (int i = mrange.begin_thread; i < i_end; i += 2) {
-            const int batch_size = (i + 1 < i_end) ? 2 : 1; // 当前批次处理的行数
-            
-            for (int j = 0; j < m; j += 2) {
-                const int token_batch_size = (j + 1 < m) ? 2 : 1; // 当前批次处理的token数
+        if (nrc == 4) {
+            // nrc=4: 4x4块处理策略
+            // 主循环：先对矩阵按4x4的大块处理
+            for (; i + 3 < i_end; i += 4) {
+                int j = 0;
                 
-                for (int proj = 0; proj < 2; proj++) { // 0=gate, 1=up
-                    f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
-                    char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
-                    char *base_weight_ptr = weight_ptr + i * weight_stride;
-                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
-                    
-                    // 预取优化
-                    __builtin_prefetch(base_output_ptr, 1, 2);
-                    if (token_batch_size == 2) {
+                // 内层4x4块处理
+                for (; j + 3 < m; j += 4) {
+                    for (int proj = 0; proj < 2; proj++) { // 0=gate, 1=up
+                        f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *base_weight_ptr = weight_ptr + i * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        // 预取优化
+                        __builtin_prefetch(base_output_ptr, 1, 2);
                         __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                        __builtin_prefetch(base_output_ptr + 2 * output_stride, 1, 2);
+                        __builtin_prefetch(base_output_ptr + 3 * output_stride, 1, 2);
+                        
+                        // 处理4x4块
+                        g_BlockDataInfo[srcType].VecDotFunc(k,
+                            base_output_ptr, output_stride,
+                            base_weight_ptr, weight_stride,
+                            base_input_ptr, input_stride, 4);
                     }
-                    
-                    if (batch_size == 2 && token_batch_size == 2) {
-                        // 2x2块处理
+                }
+                
+                // 处理剩余token的4行输出：先用nrc=2的中块，最后用nrc=1小块
+                int jj = j;
+                
+                // 先用2x2块处理剩余的token（对于这4行）
+                for (; jj + 1 < m; jj += 2) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        int ii = 0;
+                        // 处理4行中的前2行，2个token（2x2块）
+                        for (; ii + 1 < 4; ii += 2) {
+                            f32 *base_output_ptr = output_data + (jj * output_stride) + proj * n + mrange.begin_numa + i + ii;
+                            char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                            char *base_weight_ptr = weight_ptr + (i + ii) * weight_stride;
+                            char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + jj * input_stride;
+                            
+                            // 预取优化
+                            __builtin_prefetch(base_output_ptr, 1, 2);
+                            __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                            
+                            // 处理2x2块
+                            g_BlockDataInfo[srcType].VecDotFunc(k,
+                                base_output_ptr, output_stride,
+                                base_weight_ptr, weight_stride,
+                                base_input_ptr, input_stride, 2);
+                        }
+                    }
+                }
+                
+                // 处理最后剩余的单个token（如果有）
+                if (jj < m) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        int ii = 0;
+                        // 先用2x1块处理这4行中的前2行
+                        for (; ii + 1 < 4; ii += 2) {
+                            f32 *base_output_ptr = output_data + (jj * output_stride) + proj * n + mrange.begin_numa + i + ii;
+                            char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                            char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + jj * input_stride;
+                            
+                            __builtin_prefetch(base_output_ptr, 1, 2);
+                            
+                            // 处理2行输出，单个token
+                            for (int kk = 0; kk < 2; ++kk) {
+                                g_BlockDataInfo[srcType].VecDotFunc(k,
+                                    base_output_ptr + kk, 0,
+                                    weight_ptr + (i + ii + kk) * weight_stride, 0,
+                                    base_input_ptr, 0, 1);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 处理剩余的行：先用nrc=2，最后用nrc=1
+            // 处理剩余的2行
+            if (i + 1 < i_end) {
+                int j = 0;
+                
+                // 先用2x2块处理token
+                for (; j + 1 < m; j += 2) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *base_weight_ptr = weight_ptr + i * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        // 预取优化
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                        
+                        // 处理2x2块
                         g_BlockDataInfo[srcType].VecDotFunc(k,
                             base_output_ptr, output_stride,
                             base_weight_ptr, weight_stride,
                             base_input_ptr, input_stride, 2);
-                    } else if (batch_size == 2 && token_batch_size == 1) {
-                        // 2x1块处理：单个token，2个输出行
-                        g_BlockDataInfo[srcType].VecDotFunc(k,
-                            base_output_ptr, 0,
-                            base_weight_ptr, weight_stride,
-                            base_input_ptr, 0, 1);
-                        g_BlockDataInfo[srcType].VecDotFunc(k,
-                            base_output_ptr + 1, 0,
-                            base_weight_ptr + weight_stride, 0,
-                            base_input_ptr, 0, 1);
-                    } else {
-                        // 1x块处理：单个输出行
-                        for (int t = 0; t < token_batch_size; t++) {
+                    }
+                }
+                
+                // 处理剩余token的2行输出
+                if (j < m) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        
+                        // 处理2行输出，单个token
+                        for (int ii = 0; ii < 2; ++ii) {
                             g_BlockDataInfo[srcType].VecDotFunc(k,
-                                base_output_ptr + t * output_stride, 0,
-                                base_weight_ptr, 0,
-                                base_input_ptr + t * input_stride, 0, 1);
+                                base_output_ptr + ii, 0,
+                                weight_ptr + (i + ii) * weight_stride, 0,
+                                base_input_ptr, 0, 1);
                         }
+                    }
+                }
+                i += 2;
+            }
+            
+            // 处理最后剩余的1行（如果有）
+            if (i < i_end) {
+                for (int j = 0; j < m; j++) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        f32 *output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        
+                        __builtin_prefetch(output_ptr, 1, 2);
+                        g_BlockDataInfo[srcType].VecDotFunc(k,
+                            output_ptr, 0,
+                            weight_ptr + i * weight_stride, 0,
+                            (char *)input_numa_buffers[work->my_numa] + j * input_stride, 0, 1);
+                    }
+                }
+            }
+        } else {
+            // nrc=2: 2x2块处理策略（原始逻辑）
+            // 主循环：2x2块处理
+            for (; i + 1 < i_end; i += 2) {
+                int j = 0;
+                
+                // 内层2x2块处理
+                for (; j + 1 < m; j += 2) {
+                    for (int proj = 0; proj < 2; proj++) { // 0=gate, 1=up
+                        f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *base_weight_ptr = weight_ptr + i * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        // 预取优化
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                        
+                        // 处理2x2块
+                        g_BlockDataInfo[srcType].VecDotFunc(k,
+                            base_output_ptr, output_stride,
+                            base_weight_ptr, weight_stride,
+                            base_input_ptr, input_stride, 2);
+                    }
+                }
+                
+                // 处理剩余的单个token (2x1块)
+                if (j < m) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        f32 *base_output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *base_weight_ptr = weight_ptr + i * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        
+                        // 处理2行输出，单个token
+                        for (int ii = 0; ii < 2; ++ii) {
+                            g_BlockDataInfo[srcType].VecDotFunc(k,
+                                base_output_ptr + ii, 0,
+                                base_weight_ptr + ii * weight_stride, 0,
+                                base_input_ptr, 0, 1);
+                        }
+                    }
+                }
+            }
+            
+            // 处理剩余的单个输出行 (1x块)
+            if (i < i_end) {
+                for (int j = 0; j < m; j++) {
+                    for (int proj = 0; proj < 2; proj++) {
+                        f32 *output_ptr = output_data + (j * output_stride) + proj * n + mrange.begin_numa + i;
+                        char *weight_ptr = (proj == 0) ? gate_proj_weight_ptr : up_proj_weight_ptr;
+                        char *weight_ptr_single = weight_ptr + i * weight_stride;
+                        char *input_ptr_single = (char *)input_numa_buffers[work->my_numa] + j * input_stride;
+                        
+                        __builtin_prefetch(output_ptr, 1, 2);
+                        g_BlockDataInfo[srcType].VecDotFunc(k,
+                            output_ptr, 0,
+                            weight_ptr_single, 0,
+                            input_ptr_single, 0, 1);
                     }
                 }
             }
         }
     }
 }
+
+
 
 // 通用的矩阵点乘计算函数
 void matrix_multiply_with_numa(
@@ -817,6 +847,9 @@ void matrix_multiply_with_numa(
     const int weight_stride = vec_dot_first_param / srcBlockNum * srcBlocksize;
     const int input_stride = vec_dot_first_param / dstBlockNum * dstBlocksize;
 
+    // 获取NRC值
+    const int nrc = get_nrc_value();
+
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     const bool use_i8mm_optimization = (srcType == GGML_TYPE_Q4_0 || srcType == GGML_TYPE_Q8_0);
 #else
@@ -836,55 +869,196 @@ void matrix_multiply_with_numa(
         }
     }
     else {
-        // i8mm优化模式：2x2块处理优化
+        // i8mm优化模式：根据nrc值选择不同的块处理策略
         const int i_end = mrange.end_thread;
         int i = mrange.begin_thread;
         
-        // 主循环：2x2块处理
-        for (; i + 1 < i_end; i += 2) {
-            int k = 0;
-            
-            // 内层2x2块处理
-            for (; k + 1 < token_count; k += 2) {
-                __builtin_prefetch(output_data + mrange.begin_numa + k * output_stride + i, 1, 2);
-                __builtin_prefetch(output_data + mrange.begin_numa + (k+1) * output_stride + i, 1, 2);
+        if (nrc == 4) {
+            // nrc=4: 4x4块处理策略
+            // 主循环：4x4块处理
+            for (; i + 3 < i_end; i += 4) {
+                int k = 0;
                 
-                // 处理2x2块
-                g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
-                        output_data + mrange.begin_numa + k * output_stride + i, output_stride,
-                        weight_ptr + i * weight_stride, weight_stride,
-                        (char *)input_numa_buffers[work->my_numa] + k * input_stride, input_stride, 2);
-            }
-            
-            // 处理剩余的单个token (2xi块)
-            if (k < token_count) {
-                __builtin_prefetch(output_data + mrange.begin_numa + k * output_stride + i, 1, 2);
+                // 内层4x4块处理
+                for (; k + 3 < token_count; k += 4) {
+                    f32 *base_output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *base_weight_ptr = weight_ptr + i * weight_stride;
+                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    // 预取优化
+                    __builtin_prefetch(base_output_ptr, 1, 2);
+                    __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                    __builtin_prefetch(base_output_ptr + 2 * output_stride, 1, 2);
+                    __builtin_prefetch(base_output_ptr + 3 * output_stride, 1, 2);
+                    
+                    // 处理4x4块
+                    g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                            base_output_ptr, output_stride,
+                            base_weight_ptr, weight_stride,
+                            base_input_ptr, input_stride, 4);
+                }
                 
-                // 处理2x1块：两个输出行，一个token
-                g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
-                        output_data + mrange.begin_numa + k * output_stride + i, output_stride,
-                        weight_ptr + i * weight_stride, weight_stride,
-                        (char *)input_numa_buffers[work->my_numa] + k * input_stride, input_stride, 1);
+                // 处理剩余token的4行输出：先用nrc=2，最后用nrc=1
+                int kk = k;
+                
+                // 先用2x2块处理剩余的token（对于这4行）
+                for (; kk + 1 < token_count; kk += 2) {
+                    int ii = 0;
+                    // 处理4行中的前2行，2个token（2x2块）
+                    for (; ii + 1 < 4; ii += 2) {
+                        f32 *base_output_ptr = output_data + mrange.begin_numa + kk * output_stride + i + ii;
+                        char *base_weight_ptr = weight_ptr + (i + ii) * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + kk * input_stride;
                         
-                g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
-                        output_data + mrange.begin_numa + k * output_stride + i + 1, output_stride,
-                        weight_ptr + (i + 1) * weight_stride, weight_stride,
-                        (char *)input_numa_buffers[work->my_numa] + k * input_stride, input_stride, 1);
+                        // 预取优化
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                        
+                        // 处理2x2块
+                        g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                                base_output_ptr, output_stride,
+                                base_weight_ptr, weight_stride,
+                                base_input_ptr, input_stride, 2);
+                    }
+                }
+                
+                // 处理最后剩余的单个token（如果有）
+                if (kk < token_count) {
+                    int ii = 0;
+                    // 先用2x1块处理这4行中的前2行
+                    for (; ii + 1 < 4; ii += 2) {
+                        f32 *base_output_ptr = output_data + mrange.begin_numa + kk * output_stride + i + ii;
+                        char *base_weight_ptr = weight_ptr + (i + ii) * weight_stride;
+                        char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + kk * input_stride;
+                        
+                        __builtin_prefetch(base_output_ptr, 1, 2);
+                        
+                        // 处理2行输出，单个token
+                        for (int jj = 0; jj < 2; ++jj) {
+                            g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                                    base_output_ptr + jj, 0,
+                                    base_weight_ptr + jj * weight_stride, 0,
+                                    base_input_ptr, 0, 1);
+                        }
+                    }
+                }
             }
-        }
-        
-        // 处理剩余的单个输出行 (1x块)
-        if (i < i_end) {
-            for (int k = 0; k < token_count; k++) {
-                __builtin_prefetch(output_data + mrange.begin_numa + k * output_stride + i, 1, 2);
-                g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
-                        output_data + mrange.begin_numa + k * output_stride + i, output_stride,
-                        weight_ptr + i * weight_stride, weight_stride,
-                        (char *)input_numa_buffers[work->my_numa] + k * input_stride, input_stride, 1);
+            
+            // 处理剩余的行：先用nrc=2，最后用nrc=1
+            // 处理剩余的2行
+            if (i + 1 < i_end) {
+                int k = 0;
+                
+                // 先用2x2块处理token  
+                for (; k + 1 < token_count; k += 2) {
+                    f32 *base_output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *base_weight_ptr = weight_ptr + i * weight_stride;
+                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    // 预取优化
+                    __builtin_prefetch(base_output_ptr, 1, 2);
+                    __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                    
+                    // 处理2x2块
+                    g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                            base_output_ptr, output_stride,
+                            base_weight_ptr, weight_stride,
+                            base_input_ptr, input_stride, 2);
+                }
+                
+                // 处理剩余token的2行输出
+                if (k < token_count) {
+                    f32 *base_output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *base_weight_ptr = weight_ptr + i * weight_stride;
+                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    __builtin_prefetch(base_output_ptr, 1, 2);
+                    
+                    // 处理2行输出，单个token
+                    for (int ii = 0; ii < 2; ++ii) {
+                        g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                                base_output_ptr + ii, 0,
+                                base_weight_ptr + ii * weight_stride, 0,
+                                base_input_ptr, 0, 1);
+                    }
+                }
+                i += 2;
+            }
+            
+            // 处理最后剩余的1行（如果有）
+            if (i < i_end) {
+                for (int k = 0; k < token_count; k++) {
+                    f32 *output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *weight_ptr_single = weight_ptr + i * weight_stride;
+                    char *input_ptr_single = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    __builtin_prefetch(output_ptr, 1, 2);
+                    g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                            output_ptr, 0,
+                            weight_ptr_single, 0,
+                            input_ptr_single, 0, 1);
+                }
+            }
+        } else {
+            // nrc=2: 2x2块处理策略（原始逻辑）
+            // 主循环：2x2块处理
+            for (; i + 1 < i_end; i += 2) {
+                int k = 0;
+                
+                // 内层2x2块处理
+                for (; k + 1 < token_count; k += 2) {
+                    f32 *base_output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *base_weight_ptr = weight_ptr + i * weight_stride;
+                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    // 预取优化
+                    __builtin_prefetch(base_output_ptr, 1, 2);
+                    __builtin_prefetch(base_output_ptr + output_stride, 1, 2);
+                    
+                    // 处理2x2块
+                    g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                            base_output_ptr, output_stride,
+                            base_weight_ptr, weight_stride,
+                            base_input_ptr, input_stride, 2);
+                }
+                
+                // 处理剩余的单个token (2x1块)
+                if (k < token_count) {
+                    f32 *base_output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *base_weight_ptr = weight_ptr + i * weight_stride;
+                    char *base_input_ptr = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    __builtin_prefetch(base_output_ptr, 1, 2);
+                    
+                    // 处理2行输出，单个token
+                    for (int ii = 0; ii < 2; ++ii) {
+                        g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                                base_output_ptr + ii, 0,
+                                base_weight_ptr + ii * weight_stride, 0,
+                                base_input_ptr, 0, 1);
+                    }
+                }
+            }
+            
+            // 处理剩余的单个输出行 (1x块)
+            if (i < i_end) {
+                for (int k = 0; k < token_count; k++) {
+                    f32 *output_ptr = output_data + mrange.begin_numa + k * output_stride + i;
+                    char *weight_ptr_single = weight_ptr + i * weight_stride;
+                    char *input_ptr_single = (char *)input_numa_buffers[work->my_numa] + k * input_stride;
+                    
+                    __builtin_prefetch(output_ptr, 1, 2);
+                    g_BlockDataInfo[srcType].VecDotFunc(vec_dot_first_param,
+                            output_ptr, 0,
+                            weight_ptr_single, 0,
+                            input_ptr_single, 0, 1);
+                }
             }
         }
     }
 }
+
+
 
 /* 反量化 */
 void Dequantize(void *DstData, void *SrcData, WEIGHT *pstWeight, int dataNum)
@@ -987,10 +1161,6 @@ void qkv_rope_and_cache_numa(
         Rope_embedding_impl(g_pstModelHypePara.is_neox_style, g_pstModelHypePara.n_rotary, q_ptr + t * qkv_dim + h * head_size,
                             g_pstModelHypePara.cos_sin_cache, pos[t]);
         
-        // Q的缩放
-        for (int j = 0; j < head_size; j++) {
-            q_ptr[t * qkv_dim + h * head_size + j] *= attn_scale;
-        }
     }
 }
 
@@ -1664,6 +1834,7 @@ if (work.tid == 0) {
     fprintf(stderr, "[12] output_norm add and rmsnorm ——> %8.3lf ms\n", time[12] / 1000000.0);
     fprintf(stderr, "[13] (output)quantize-memcpy-matmul ——> %8.3lf ms\n", time[13] / 1000000.0);
     fprintf(stderr, "[14] output quantize f16 ——> %8.3lf ms\n\n", time[14] / 1000000.0);
+    fprintf(stderr, "[sum] sum matmul ——> %8.3lf ms\n\n", (time[2] + time[7] + time[9] + time[11]  + time[13])/ 1000000.0);
 #endif
 }
 

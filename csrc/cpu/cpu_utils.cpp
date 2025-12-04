@@ -12,6 +12,7 @@
 // 全局变量定义
 std::vector<int> cpu_ids = {};
 bool i8mm_flag = false;
+int nrc_value = 2;  // 默认值为2
 
 // 字符串分割函数
 std::vector<std::string> split_str(const std::string& str, char delimiter) {
@@ -155,6 +156,26 @@ bool init_i8mm_flag() {
         initialized = true;
     }
     return i8mm_flag;
+}
+
+// 获取NRC环境变量
+int get_nrc_value() {
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const char* env = getenv("NRC");
+        if (env && *env) {
+            int value = std::stoi(env);
+            if (value == 2 || value == 4) {
+                nrc_value = value;
+            } else {
+                std::cout << "Warning: Invalid NRC value '" << value << "', using default value 2" << std::endl;
+                nrc_value = 2;
+            }
+        }
+        std::cout << "NRC value: " << nrc_value << std::endl;
+    }
+    return nrc_value;
 }
 
 // 初始化工作分配结构体
