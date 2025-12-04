@@ -112,9 +112,10 @@ git apply boostkit-vllm-ops-gpu-082.patch
 
 ```bash
 yum install -y libomp #安装libomp依赖包
-git clone https://gitcode.com/boostkit/vllm-ops.git -b dev
-git apply boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
-git apply boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
+git clone https://gitee.com/openeuler/sysHAX-adapter.git -b vllm_sysHAX
+cd sysHAX-adapter
+git apply ../boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
+git apply ../boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
 VLLM_TARGET_DEVICE=cpu pip install -v .
 ```
 
@@ -151,10 +152,10 @@ VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFIN
 推荐使用组合为 **SYSHAX_QUANTIZE=q4_0 NRC=4** 或 **SYSHAX_QUANTIZE=q8_0 NRC=2**
 
 **新增启动参数**
-| 启动参数 | 可选值 |说明 |
-|---------------|------|------|
-| --use-greedy | 无(默认关闭) | 可同时用于gpu容器和cpu容器的实例，用于提升Sampler部分的性能 |
-
+| 启动参数  |说明 |
+|---------------|------|
+| --use-greedy | 可同时用于gpu容器和cpu容器的实例，用于提升Sampler部分的性能 |
+| --enable-auto-pd-offload | 支持pd分离，使用sysHAX时需要添加 |
 
 ---
 
