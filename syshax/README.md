@@ -42,7 +42,7 @@ modelscope download --model tclf90/deepseek-r1-distill-qwen-32b-gptq-int8 --loca
 
 #### 2、获取容器
 
-参考 [sysHax部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md)
+参考 [sysHax部署指南](https://gitee.com/openeuler/sysHAX/blob/v0.2.1/docs/sysHAX_online_deployment_guide_on_CPU+GPU.md)
 
 获取得到 sysHAX cpu部分的容器（此处为syshax-vllm-cpu:0.2.1版本）
 
@@ -112,8 +112,9 @@ git apply boostkit-vllm-ops-gpu-082.patch
 
 ```bash
 yum install -y libomp #安装libomp依赖包
-git clone https://gitee.com/openeuler/sysHAX-adapter.git -b vllm_sysHAX
+git clone https://gitee.com/openeuler/sysHAX-adapter.git
 cd sysHAX-adapter
+git checkout tags/vllm_sysHAX
 git apply ../boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
 git apply ../boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
 VLLM_TARGET_DEVICE=cpu pip install -v .
@@ -138,7 +139,7 @@ VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFIN
 注：
 1、cpu侧不要使用所有的核心，预留部分核心供gpu调度及部分计算使用。
 2、/home/models/tclf90_deepseek-r1-distill-qwen-32b-gptq-int8/ 为模型存放路径，请替换成实际使用的模型及路径。
-3、sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md) 的源码部署模式进行部署，并参考指南中方式修改端口和并发量。
+3、sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/v0.2.1/docs/sysHAX_online_deployment_guide_on_CPU+GPU.md) 的源码部署模式进行部署，并参考指南中方式修改端口和并发量。
 
 ---
 
