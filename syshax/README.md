@@ -24,7 +24,7 @@ vllm-ops是鲲鹏自研的向量检索加速组件，对接vllm使用。本仓�
 
 此处以在一台 kunpeng 920新型号 + 沐曦C500 * 1的容器部署运行 tclf90_deepseek-r1-distill-qwen-32b-gptq-int8 为例。
 
-在此环境中，我们已经完成了沐曦容器的部署，以下以 **vllm-gpu** 代指该容器。
+此环境中已完成沐曦容器的部署，以下以 **vllm-gpu** 代指该容器。
 
 #### 1、获取模型
 
@@ -42,7 +42,7 @@ modelscope download --model tclf90/deepseek-r1-distill-qwen-32b-gptq-int8 --loca
 
 #### 2、获取容器
 
-参考 [sysHax部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md)
+参考 [sysHax部署指南](https://gitee.com/openeuler/sysHAX/blob/v0.2.1/docs/sysHAX_online_deployment_guide_on_CPU+GPU.md)
 
 获取得到 sysHAX cpu部分的容器（此处为syshax-vllm-cpu:0.2.1版本）
 
@@ -112,8 +112,9 @@ git apply boostkit-vllm-ops-gpu-082.patch
 
 ```bash
 yum install -y libomp #安装libomp依赖包
-git clone https://gitee.com/openeuler/sysHAX-adapter.git -b vllm_sysHAX
+git clone https://gitee.com/openeuler/sysHAX-adapter.git
 cd sysHAX-adapter
+git checkout tags/vllm_sysHAX
 git apply ../boostkit-vllm-ops-cpu-gptq.patch #适配cpu侧读取gptq量化后的模型
 git apply ../boostkit-vllm-ops-cpu-opt.patch #加速cpu侧推理速度
 VLLM_TARGET_DEVICE=cpu pip install -v .
@@ -138,9 +139,8 @@ VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFIN
 注：
 1、cpu侧不要使用所有的核心，预留部分核心供gpu调度及部分计算使用。
 2、/home/models/tclf90_deepseek-r1-distill-qwen-32b-gptq-int8/ 为模型存放路径，请替换成实际使用的模型及路径。
-3、sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/master/docs/sysHAX_online_deployment_guide.md) 的源码部署模式进行部署，并参考指南中方式修改端口和并发量。
+3、sysHAX启动方式推荐参考 [sysHAX部署指南](https://gitee.com/openeuler/sysHAX/blob/v0.2.1/docs/sysHAX_online_deployment_guide_on_CPU+GPU.md) 的源码部署模式进行部署，并参考指南中方式修改端口和并发量。
 
----
 
 **新增环境变量**
 
@@ -158,6 +158,16 @@ VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFIN
 | --enable-auto-pd-offload | 支持pd分离，使用sysHAX时需要添加 |
 
 ---
+
+# 通信矩阵
+
+| 源设备 | 源ip地址 | 源端口 | 目的设备 | 目的IP地址 | 目的端口（侦听）| 协议 | 端口说明 | 侦听端口是否可更改 | 认证方式 | 所属平面 | 版本 | 特殊场景 | 
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 用户所在服务器| 用户服务器IP地址 | * | 运行sysHAX的服务器| 8000~9000| 运行sysHAX的IP地址 | HTTP/HTTPS | 接受用户推理请求 |  是 | N/A | N/A | 业务面 | 所有版本 | 无 |
+| sysHAX所在服务器| sysHAX服务器IP地址 | * | 运行vllm-gpu的服务器| 8000~9000| 运行vllm-gpu的IP地址 | HTTP/HTTPS | 接受sysHAX转发的用户推理请求 |  是 | N/A | N/A | 业务面 | 所有版本 | 无 |
+| sysHAX所在服务器| sysHAX服务器IP地址 | * | 运行vllm-cpu的服务器 | 8000~9000| 运行vllm-cpu的IP地址 | HTTP/HTTPS | 接受用户推理请求 |  是 | N/A | N/A | 业务面 | 所有版本 | 无 |
+
+
 
 # 贡献指南
 如果使用过程中有任何问题，或者需要反馈特性需求和bug报告，可以提交isssues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。
