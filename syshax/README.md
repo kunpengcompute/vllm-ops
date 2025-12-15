@@ -1,6 +1,6 @@
 # 项目介绍
 
-vllm-ops是鲲鹏自研的推理加速组件，对接vllm使用。本仓库中提供了对接openEuler的sysHax插件的适配与优化。vllm-ops适用于鲲鹏920新型号处理器，支持NEON指令（128位宽）和SVE指令（256位宽）。
+vllm-ops是鲲鹏自研的推理加速组件，对接vllm使用。本仓库中提供了对接openEuler的sysHax插件的适配与优化，适用于鲲鹏920新型号处理器，支持NEON指令（128位宽）和SVE指令（256位宽）。
 
 
 
@@ -170,7 +170,7 @@ VLLM_USE_V1=0 NRC=4 INFERENCE_OP_MODE=fused OMP_NUM_THREADS=128 CUSTOM_CPU_AFFIN
 
 
 # 贡献指南
-如果使用过程中有任何问题，或者需要反馈特性需求和bug报告，可以提交isssues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。
+如果使用过程中有任何问题，或者需要反馈特性需求和bug报告，可以提交issues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。
 
 
 # 免责声明
