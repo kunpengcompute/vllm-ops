@@ -1,6 +1,6 @@
 # 项目介绍
 
-vllm-ops是鲲鹏自研的向量检索加速组件，对接vllm使用。本仓库中提供了对接openEuler的sysHax插件的适配与优化。vllm-ops适用于鲲鹏920新型号处理器，支持NEON指令（128位宽）和SVE指令（256位宽）。
+vllm-ops是鲲鹏自研的推理加速组件，对接vllm使用。本仓库中提供了对接openEuler的sysHax插件的适配与优化。vllm-ops适用于鲲鹏920新型号处理器，支持NEON指令（128位宽）和SVE指令（256位宽）。
 
 
 
