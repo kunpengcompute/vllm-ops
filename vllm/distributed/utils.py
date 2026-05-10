@@ -39,10 +39,8 @@ USE_SCHED_YIELD = ((sys.version_info[:3] >= (3, 11, 1))
 
 
 def sched_yield():
-    if USE_SCHED_YIELD:
-        os.sched_yield()
-    else:
-        time.sleep(0)
+    # sched_yield在arm机器上出现劣化，替换使用time.sleep(1e-5)
+    time.sleep(1e-5)
 
 
 def ensure_divisibility(numerator, denominator):
