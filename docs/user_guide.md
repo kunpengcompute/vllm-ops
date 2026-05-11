@@ -67,9 +67,16 @@ patch -pXXX < XXX.patch
 参考测试方法：
 模型路径：/xxx/Qwen3-32B
 
+设置环境变量
+```bash
+export MACA_SIGNAL_WAIT_MODE=2
+```
+
 启动服务：
+```bash
 LD_PRELOAD=/usr/local/ksl/libkqmalloc.so vllm  serve   /home/models/Qwen3-32B/     --host 0.0.0.0     --port 8206      --block_size=16     --max_model_len=9120   --tensor-parallel-size 4     --gpu_memory_utilization=0.95  --no-enable-prefix-caching --trust_remote_code --async-scheduling
-
+```
 执行命令：
-
-vllm bench serve --backend vllm --model /home/models/Qwen3-32B --dataset-name random --random-input-len 4096 --random-output-len 1024 --request-rate 2 --num-prompts 2 --host 127.0.0.1 --port 8002```
+```bash
+vllm bench serve --backend vllm --model /home/models/Qwen3-32B --dataset-name random --random-input-len 4096 --random-output-len 1024 --request-rate 2 --num-prompts 2 --host 127.0.0.1 --port 8002
+```
