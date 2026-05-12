@@ -151,7 +151,13 @@ class EagleProposer:
             device=device,
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
+# ==============================================================================
+# 参考 PR: https://github.com/vllm-project/vllm/pull/27615
+# PR 作者: njhill
+# 优化说明: 批量更新np.array
+# ==============================================================================
 
+# ================ OPTIMIZATION POINT 1 ================
     def propose(
         self,
         # [num_tokens]
@@ -166,6 +172,7 @@ class EagleProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
+        kv_caches=None
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -236,23 +243,24 @@ class EagleProposer:
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
             ret_hidden_states = self.model(
-                input_ids=input_ids,
-                positions=self.positions[:num_input_tokens],
-                hidden_states=self.hidden_states[:num_input_tokens],
-                inputs_embeds=inputs_embeds,
+                input_ids=input_ids.to("cpu"),
+                positions=self.positions[:num_input_tokens].to("cpu"),
+                hidden_states=self.hidden_states[:num_input_tokens].to("cpu"),
+                inputs_embeds=inputs_embeds.to("cpu"),
             )
+            ret_hidden_states = ret_hidden_states.to("cuda")
             if self.method == "mtp":
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
         sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        logits = self.model.compute_logits(sample_hidden_states.to("cpu"))
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
-            return draft_token_ids.view(-1, 1)
+            return draft_token_ids.view(-1, 1).to("cuda")
 
         positions = target_positions[last_token_indices]
         if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
@@ -270,7 +278,7 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+            return torch.cat(draft_token_ids_list, dim=1).to("cuda")
 
         draft_token_ids = logits.argmax(dim=-1)
 
@@ -365,24 +373,26 @@ class EagleProposer:
                                      self.vllm_config,
                                      num_tokens=input_batch_size):
                 ret_hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=self.positions[:input_batch_size],
-                    hidden_states=self.hidden_states[:input_batch_size],
-                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids.to("cpu"),
+                    positions=self.positions[:input_batch_size].to("cpu"),
+                    hidden_states=self.hidden_states[:input_batch_size].to("cpu"),
+                    inputs_embeds=inputs_embeds.to("cpu"),
                 )
+                ret_hidden_states = ret_hidden_states.to("cuda")
                 if self.method == "mtp":
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
+            logits = self.model.compute_logits(last_hidden_states[:batch_size].to("cpu"))
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        return draft_token_ids.to("cuda")
+# ================ OPTIMIZATION POINT 1 ================
 
     def prepare_next_token_ids_cpu(
             self, sampled_token_ids: list[list[int]],
@@ -665,16 +675,24 @@ class EagleProposer:
                     num_tokens)
             else:
                 num_input_tokens = num_tokens
+# ==============================================================================
+# 参考 PR: https://github.com/vllm-project/vllm/pull/27615
+# PR 作者: njhill
+# 优化说明: 批量更新np.array
+# ==============================================================================
+
+# ================ OPTIMIZATION POINT 2 ================
             # Run the model.
             with set_forward_context(per_layer_attn_metadata,
                                      self.vllm_config,
                                      num_tokens=num_input_tokens):
                 last_hidden_states, hidden_states = self.model(
-                    input_ids=self.input_ids[:num_input_tokens],
-                    positions=self.positions[:num_input_tokens],
-                    hidden_states=self.hidden_states[:num_input_tokens],
+                    input_ids=self.input_ids[:num_input_tokens].to("cpu"),
+                    positions=self.positions[:num_input_tokens].to("cpu"),
+                    hidden_states=self.hidden_states[:num_input_tokens].to("cpu"),
                     inputs_embeds=None,
                 )
+                last_hidden_states, hidden_states = last_hidden_states.to("cuda"), hidden_states.to("cuda")
 
             # Get the output hidden states for the draft tokens.
             draft_hidden_states = hidden_states[:num_tokens].view(
@@ -685,7 +703,7 @@ class EagleProposer:
             # Get the output logits for the draft tokens.
             logits = self.model.compute_logits(
                 draft_last_hidden_states.reshape(batch_size * level_num_drafts,
-                                                 -1))
+                                                 -1).to("cpu"))
 
             # Sample a draft token for each child at the next tree level.
             num_children = self.child_drafts_per_level[level + 1]
@@ -821,6 +839,8 @@ class EagleProposer:
             self.model = get_model(vllm_config=self.vllm_config,
                                    model_config=draft_model_config)
 
+        # TODO: 在这里将model迁移至CPU
+            self.model = self.model.to("cpu")
         draft_attn_layer_names = (
             get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
             target_attn_layer_names)
@@ -917,10 +937,10 @@ class EagleProposer:
                 inputs_embeds = None
 
             self.model(
-                input_ids=input_ids,
-                positions=self.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
+                input_ids=input_ids.to("cpu"),
+                positions=self.positions[:num_tokens].to("cpu"),
+                hidden_states=self.hidden_states[:num_tokens].to("cpu"),
+                inputs_embeds=inputs_embeds.to("cpu"),
             )
 
     def _get_attention_metadata_builder(

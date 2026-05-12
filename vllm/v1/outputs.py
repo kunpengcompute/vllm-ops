@@ -18,16 +18,29 @@ class LogprobsLists(NamedTuple):
     logprob_token_ids: list[list[int]]
     # [num_reqs, max_num_logprobs + 1]
     logprobs: list[list[float]]
-    # [num_reqs]
+    # [num_reqs x num_generated_tokens]
     sampled_token_ranks: list[int]
-
-    def slice(self, start: int, end: int):
+    # [num_reqs]
+    # Used for slicing the logprobs in cases like speculative
+    # decoding where the number of generated tokens may be
+    # different for each request.
+    cu_num_generated_tokens: list[int] | None = None
+ 
+    def slice(self, start_req_idx: int, end_req_idx: int):
+        if self.cu_num_generated_tokens:
+            start = self.cu_num_generated_tokens[start_req_idx]
+            end = self.cu_num_generated_tokens[end_req_idx]
+        else:
+            start = start_req_idx
+            end = end_req_idx
         return LogprobsLists(
             self.logprob_token_ids[start:end],
             self.logprobs[start:end],
             self.sampled_token_ranks[start:end],
+            self.cu_num_generated_tokens[start_req_idx:end_req_idx]
+            if self.cu_num_generated_tokens
+            else None,
         )
-
 
 class LogprobsTensors(NamedTuple):
 
@@ -38,11 +51,21 @@ class LogprobsTensors(NamedTuple):
     # [num_reqs]
     selected_token_ranks: torch.Tensor
 
-    def tolists(self):
+    def tolists(self, cu_num_generated_tokens: list[int] | None = None):
         return LogprobsLists(
             self.logprob_token_ids.tolist(),
             self.logprobs.tolist(),
             self.selected_token_ranks.tolist(),
+            cu_num_generated_tokens
+        )
+ 
+    def to_cpu_nonblocking(self) -> "LogprobsTensors":
+        if self.logprob_token_ids.device.type == "cpu":
+            return self
+        return LogprobsTensors(
+            self.logprob_token_ids.to("cpu", non_blocking=True),
+            self.logprobs.to("cpu", non_blocking=True),
+            self.selected_token_ranks.to("cpu", non_blocking=True),
         )
 
     @staticmethod
