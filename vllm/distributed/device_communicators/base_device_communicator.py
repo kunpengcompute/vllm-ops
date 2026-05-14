@@ -125,11 +125,14 @@ class DeviceCommunicatorBase:
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(input_, group=self.device_group)
         return input_
+# ==============================================================================
+# 参考 PR: https://github.com/vllm-project/vllm/pull/33740
+# PR 作者: eellison
+# 优化说明: 拆分 all_gather 操作，将核心通信算子抽离，便于融入 CUDA Graph 加速
+# ==============================================================================
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
+    def all_gather_raw(self, input_: torch.Tensor) -> torch.Tensor:
+        """All-gather without reshape. Returns (world_size, *input_shape)."""
         input_size = input_.size()
         # NOTE: we have to use concat-style all-gather here,
         # stack-style all-gather has compatibility issues with
@@ -144,6 +147,19 @@ class DeviceCommunicatorBase:
                                     input_,
                                     group=self.device_group)
         # Reshape
+        # output_tensor = output_tensor.reshape((self.world_size, ) + input_size)
+        return output_tensor.reshape((self.world_size,) + input_size)
+ 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+        input_size = input_.size()
+ 
+        # Use all_gather_raw for the NCCL collective
+        output_tensor = self.all_gather_raw(input_)
+ 
+        # Reshape to final output
         output_tensor = output_tensor.reshape((self.world_size, ) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(input_size[:dim] +
@@ -151,6 +167,7 @@ class DeviceCommunicatorBase:
                                                input_size[dim], ) +
                                               input_size[dim + 1:])
         return output_tensor
+# ================ OPTIMIZATION POINT 1 ================
 
     def all_gatherv(
         self,

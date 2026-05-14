@@ -147,12 +147,39 @@ def all_gather_fake(tensor: torch.Tensor, dim: int, world_size: int,
     new_shape[dim] = tensor.shape[dim] * world_size
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
+def all_gather_raw(
+    tensor: torch.Tensor, world_size: int, group_name: str
+) -> torch.Tensor:
+    """All-gather without reshape. Returns (world_size, *input_shape)."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_gather_raw(tensor)
+ 
+ 
+def all_gather_raw_fake(
+    tensor: torch.Tensor, world_size: int, group_name: str
+) -> torch.Tensor:
+    return torch.empty(
+        (world_size,) + tensor.shape,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+ 
+
 
 if supports_custom_op():
     direct_register_custom_op(
         op_name="all_reduce",
         op_func=all_reduce,
         fake_impl=all_reduce_fake,
+    )
+
+    direct_register_custom_op(
+        op_name="all_gather_raw",
+        op_func=all_gather_raw,
+        fake_impl=all_gather_raw_fake,
     )
 
     direct_register_custom_op(
@@ -395,6 +422,15 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
+
+    def _all_gather_raw(self, input_: torch.Tensor) -> torch.Tensor:
+        """
+        Raw all_gather that only performs NCCL collective.
+        Returns tensor with shape (world_size, *input_shape).
+        """
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather_raw(input_)
 
     def reduce_scatter(self,
                        input_: torch.Tensor,
