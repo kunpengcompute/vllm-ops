@@ -212,7 +212,6 @@ class Scheduler(SchedulerInterface):
         max_model_len = self.max_model_len
         long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
         chunked_prefill_enabled = self.scheduler_config.chunked_prefill_enabled
-        policy_is_priority = (self.policy == SchedulingPolicy.PRIORITY)
         use_kv_connector = (self.connector is not None)
         is_encoder_decoder = self.is_encoder_decoder
         kv_cache_manager = self.kv_cache_manager
@@ -341,7 +340,7 @@ class Scheduler(SchedulerInterface):
                     # ==================== OPTIMIZATION POINT 6 ====================
                     # 使用切片而不是del
                     # del request.spec_token_ids[num_scheduled_spec_tokens:]
-                    request.spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                    request.spec_token_ids = request.spec_token_ids[:num_scheduled_spec_tokens]
                     # ==================== ==================== ====================
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids)
