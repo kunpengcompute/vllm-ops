@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 Huawei Technologies Co., Ltd. 
 from typing import Union
 
 import numpy as np
@@ -77,7 +78,7 @@ class BlockTable:
     def compute_slot_mapping(self, req_indices: np.ndarray,
                              positions: np.ndarray) -> None:
         # ================ OPTIMIZATION POINT 1 ================
-        # 使用JIT进行加速
+        # 采用numba.JIT优化compute_slot_mapping方法
         num_tokens = req_indices.shape[0]
         if num_tokens < 100:
             self.compute_slot_mapping_origin(req_indices, positions)
@@ -288,4 +289,4 @@ def _compute_slot_mapping_jit(
             block_number = block_table_flat[table_idx]
             block_offset = pos % block_size
             out_slot_mapping[i] = block_number * block_size + block_offset
-# =================================================
+# =================================================
