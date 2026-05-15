@@ -88,7 +88,10 @@ class PassConfig:
     """Whether to enable flashinfer allreduce fusion."""
     fi_allreduce_fusion_max_token_num: int = 16384
     """Max number of tokens to used in flashinfer allreduce fusion."""
-
+    
+    decompose_all_gather: bool = True
+    """Decompose all_gather to expose reshape for Inductor fusion."""
+ 
     # TODO(luka) better pass enabling system.
 
     def uuid(self):

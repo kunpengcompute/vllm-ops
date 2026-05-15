@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 Huawei Technologies Co., Ltd. 
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
 from typing import Optional
@@ -630,7 +631,15 @@ class FlashAttentionImpl(AttentionImpl):
                 scheduler_metadata = attn_metadata.scheduler_metadata
 
                 #descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-                cu_prefix_kv_lens = torch.cat( [ torch.zeros(1, device=seqused_k.device, dtype=torch.int32), seqused_k.to(torch.int32) ], dim=0 ).cumsum(dim=0, dtype=torch.int32)
+                # ---------- Commit: b619d71 - 运算迁移到gpu ----------
+                # cu_prefix_kv_lens = torch.cat( [ torch.zeros(1, device=seqused_k.device, dtype=torch.int32), seqused_k.to(torch.int32) ], dim=0 ).cumsum(dim=0, dtype=torch.int32)
+                prefix_lens = attn_metadata.prefill_seq_lens.to(torch.int32)   
+                cu_prefix_kv_lens = torch.cat([
+                    torch.zeros(1, device=prefix_lens.device, dtype=torch.int32),
+                    prefix_lens
+                ], dim=0).cumsum(dim=0, dtype=torch.int32)
+                # ---------- Commit End ----------
+
                 #print(f"cu_prefix_kv_lens:{cu_prefix_kv_lens}")
                 output[:num_actual_tokens] = flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
@@ -662,10 +671,16 @@ class FlashAttentionImpl(AttentionImpl):
 
             num_decode_tokens = attn_metadata.num_decode_tokens
             if attn_metadata.num_prefills > 0:
-                cu_prefix_kv_lens = torch.tensor(
-                    [0] + attn_metadata.prefill_seq_lens.tolist(),
-                    device=attn_metadata.prefill_seq_lens.device,
-                    dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+                # -------------- OPTIMIZE --------------
+                # compute cu_prefix_kv_lens on the GPU
+                # ---------- Commit: b619d71 - 运算迁移到gpu ----------
+                prefix_lens = attn_metadata.prefill_seq_lens.to(torch.int32)
+                cu_prefix_kv_lens = torch.cat([
+                    torch.zeros(1, device=prefix_lens.device, dtype=torch.int32),
+                    prefix_lens
+                ], dim=0).cumsum(dim=0, dtype=torch.int32)
+                # ---------- Commit End ----------
+                # -------------- OPTIMIZE --------------
                 output[num_decode_tokens:
                        num_actual_tokens] = flash_attn_varlen_func(
                            q=query[num_decode_tokens:num_actual_tokens],

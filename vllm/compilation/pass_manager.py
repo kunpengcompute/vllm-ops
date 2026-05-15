@@ -21,6 +21,8 @@ if current_platform.is_cuda_alike():
 if current_platform.is_cuda():
     from .collective_fusion import AllReduceFusionPass, AsyncTPPass
 
+from .collective_fusion import AllGatherDecomposePass
+ 
 from .fix_functionalization import FixFunctionalizationPass
 from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
 from .noop_elimination import NoOpEliminationPass
@@ -103,7 +105,12 @@ class PostGradPassManager(CustomGraphPass):
 
         if self.pass_config.enable_attn_fusion:
             self.passes += [AttnFusionPass(config)]
-
+            
+        # Decompose remaining all_gather ops to expose reshape for fusion.
+        # This runs AFTER fusion pattern matchers so they get first chance.
+        if self.pass_config.decompose_all_gather:
+            self.passes += [AllGatherDecomposePass(config)]
+ 
         # needs a functional graph
         self.post_cleanup = PostCleanupPass(config)
         self.fix_functionalization = FixFunctionalizationPass(config)

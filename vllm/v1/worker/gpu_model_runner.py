@@ -133,6 +133,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self,
         model_runner_output: ModelRunnerOutput,
         sampled_token_ids: torch.Tensor,
+        logprobs_tensors: torch.Tensor | None,
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
     ):
@@ -140,36 +141,48 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
-        self._async_copy_ready_event = torch.cuda.Event()
+        self.async_copy_ready_event = torch.cuda.Event()
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
+        self._logprobs_tensors = logprobs_tensors
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self._sampled_token_ids_cpu = self._sampled_token_ids.to(
-                'cpu', non_blocking=True)
-            self._async_copy_ready_event.record()
+            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                "cpu", non_blocking=True
+            )
+            self._logprobs_tensors_cpu = (
+                self._logprobs_tensors.to_cpu_nonblocking()
+                if self._logprobs_tensors
+                else None
+            )
+            self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         
         This function blocks until the copy is finished.
         """
-        self._async_copy_ready_event.synchronize()
-
-        # Release the device tensor once the copy has completed
+        self.async_copy_ready_event.synchronize()
+ 
+        # Release the device tensors once the copy has completed
+        del self._logprobs_tensors
         del self._sampled_token_ids
-
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+ 
+        valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
         for i in self._invalid_req_indices:
             valid_sampled_token_ids[i].clear()
-
+ 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
+        if self._logprobs_tensors_cpu:
+            # NOTE(nick): this will need to be updated to use cu_num_accepted_tokens
+            # for async sched + spec decode + logprobs compatibility.
+            output.logprobs = self._logprobs_tensors_cpu.tolists()
         return output
 
 
@@ -534,6 +547,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+
+        # --- 1. 优化1 合并两个for循环 ---
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -542,8 +557,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
-        for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        # ------------------------------
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -984,7 +999,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            token_indices_tensor,
                            out=self.input_ids.cpu[:total_num_scheduled_tokens])
         if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids.flatten()
+            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
                 is_token_ids,
                 0,
@@ -2058,6 +2073,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            # Update output token ids with tokens sampled in last step
+            # if async scheduling and required by current sampling params.
+            self.input_batch.update_async_output_token_ids()
             sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -2092,17 +2110,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return sampler_output
 
     def _bookkeeping_sync(
-        self, scheduler_output: "SchedulerOutput",
-        sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
-        hidden_states: torch.Tensor, num_scheduled_tokens: int
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampler_output: SamplerOutput,
+        logits: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
-            dict[str, int],
-            Optional[LogprobsLists],
-            list[list[int]],
-            dict[str, Optional[LogprobsTensors]],
-            list[str],
-            dict[str, int],
-            list[int],
+        dict[str, int],
+        LogprobsLists | None,
+        list[np.ndarray],
+        dict[str, LogprobsLists | None],
+        list[str],
+        dict[str, int],
+        list[int],
     ]:
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -2121,21 +2143,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         req_id_to_index_output_copy = \
             self.input_batch.req_id_to_index.copy()
 
-        # NOTE: GPU -> CPU Sync happens here.
-        # Move as many CPU operations as possible before this sync point.
-        logprobs_tensors = sampler_output.logprobs_tensors
-        logprobs_lists = logprobs_tensors.tolists() \
-            if logprobs_tensors is not None else None
-
-        # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
-        )
-
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         invalid_req_indices = []
+        valid_sampled_token_ids: list[np.ndarray]
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
@@ -2150,7 +2161,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             # Mask out the sampled tokens that should not be sampled.
             for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[int(i)].clear()
+                valid_sampled_token_ids[int(i)] = np.array([])
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -2160,15 +2171,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
-            self.input_batch.prev_sampled_token_ids = \
-                sampled_token_ids
-            self.input_batch.prev_sampled_token_ids_invalid_indices = \
-                invalid_req_indices_set
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+
+        # Collect updates in the for loop and apply a batch update at the end
+        # to vectorize updates to tensors and numpy arrays.
+        start_indices = self.input_batch.num_tokens_no_spec.tolist()
+        # Indices and values to update for num_tokens and num_tokens_no_spec
+        num_tokens_indices_to_update: list[int] = []
+        num_tokens_values_to_update: list[int] = []
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2176,31 +2191,78 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
+        logprobs_tensors = sampler_output.logprobs_tensors
+        cu_num_accepted_tokens = (
+            [0] if spec_decode_metadata and logprobs_tensors else None
+        )
         for req_idx in range(num_sampled_tokens):
+            sampled_ids: np.ndarray | None
             if self.use_async_scheduling:
-                sampled_ids = [-1] if \
-                    req_idx not in invalid_req_indices_set else None
+                sampled_ids = np.array([-1]) if req_idx not in invalid_req_indices_set else None
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
-            if not sampled_ids:
+            num_sampled_ids: int = (
+                sampled_ids.shape[0] if sampled_ids is not None else 0
+            )
+            if not sampled_ids or num_sampled_ids == 0:
                 continue
 
-            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-            end_idx = start_idx + len(sampled_ids)
+            # start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            start_idx = start_indices[req_idx]
+            end_idx = start_idx + num_sampled_ids
             assert end_idx <= self.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
                 f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}")
+                f"{self.max_model_len}"
+            )
 
-            self.input_batch.token_ids_cpu[req_idx,
-                                           start_idx:end_idx] = sampled_ids
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-            self.input_batch.num_tokens[req_idx] = end_idx
+            # self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            # self.input_batch.num_tokens[req_idx] = end_idx
+
+            # Collect updates to num_tokens and num_tokens_no_spec,
+            # which is equivilent to
+            # - self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            # - self.input_batch.num_tokens[req_idx] = end_idx
+            num_tokens_indices_to_update.append(req_idx)
+            num_tokens_values_to_update.append(end_idx)
 
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+            # Apply tensor / numpy array updates in batch
+            if num_tokens_indices_to_update:
+                # Batch update num_tokens arrays
+                self.input_batch.num_tokens[num_tokens_indices_to_update] = (
+                    num_tokens_values_to_update
+                )
+                self.input_batch.num_tokens_no_spec[num_tokens_indices_to_update] = (
+                    num_tokens_values_to_update
+                )
+
+            if cu_num_accepted_tokens is not None:
+                cu_num_accepted_tokens.append(
+                    cu_num_accepted_tokens[-1] + num_sampled_ids
+                )
+
+        # NOTE: GPU -> CPU Sync happens here.
+        # Move as many CPU operations as possible before this sync point.
+        # logprobs_tensors = sampler_output.logprobs_tensors
+        # logprobs_lists = logprobs_tensors.tolists() \
+        #     if logprobs_tensors is not None else None
+        logprobs_lists = (
+            logprobs_tensors.tolists(cu_num_accepted_tokens)
+            if not self.use_async_scheduling and logprobs_tensors is not None
+            else None
+        )
+
+        # Compute prompt logprobs if needed.
+        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
 
         return (
             num_nans_in_logits,
@@ -2412,7 +2474,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 invalid_req_indices,
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
-                                       num_scheduled_tokens)
+                                       num_scheduled_tokens, spec_decode_metadata)
 
         if (self.speculative_config and not use_padded_batch_for_eagle
                 and input_fits_in_drafter):
@@ -2437,12 +2499,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             return output
 
-        return AsyncGPUModelRunnerOutput(
+        async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
+            logprobs_tensors=sampler_output.logprobs_tensors,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
+ 
+        # Save ref of sampled_token_ids CPU tensor if the batch contains
+        # any requests with sampling params that that require output ids.
+        self.input_batch.set_async_sampled_token_ids(
+            async_output.sampled_token_ids_cpu,
+            async_output.async_copy_ready_event,
+        )
+ 
+        return async_output
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
@@ -3177,7 +3249,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        return hidden_states, hidden_states[logit_indices]
+ 
+        # return hidden_states, hidden_states[logit_indices]
+        logit_indices_device = torch.from_numpy(logit_indices).to(
+            self.device, non_blocking=True
+        )
+        return hidden_states, hidden_states[logit_indices_device] 
 
     @torch.inference_mode()
     def _dummy_sampler_run(
