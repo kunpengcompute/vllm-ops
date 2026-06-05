@@ -2,7 +2,7 @@
 
 ## 项目介绍
 
-vLLM-ops是针对鲲鹏920新型号处理作为机头搭载沐曦曦云C500 GPU时进行的推理性能提升，采用了CPU侧Python代码优化，减少CPU和GPU之间数据传输，OS侧调优等手段提升吞吐。vLLM-ops针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的输出优化patch。
+vLLM-ops是针对鲲鹏920新型号处理作为机头搭载沐曦曦云C500 GPU时进行的推理性能提升，采用了CPU侧Python代码优化，减少CPU和GPU之间数据传输，OS侧调优等手段提升吞吐。本项目针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的输出优化补丁。
 
 ## 目录结构
 
