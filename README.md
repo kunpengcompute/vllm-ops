@@ -29,7 +29,7 @@ vllm-ops/
 
 ## 版本说明
 
-vLLM-ops本身的版本说明，具体请参见《[版本说明书](./docs/release_notes.md)》。
+vLLM-ops本身的版本说明，具体请参见《[版本说明书](./docs/zh/release_notes.md)》。
 
 ## 学习文档
 
