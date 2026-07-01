@@ -1,8 +1,12 @@
 # vLLM-ops介绍
 
+## 最新消息
+
+- [2026.06.30]：面向鲲鹏920新型号处理器，发布针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的优化补丁合集。
+
 ## 项目介绍
 
-vLLM-ops是针对鲲鹏920新型号处理作为机头搭载沐曦曦云C500 GPU时进行的推理性能提升，采用了CPU侧Python代码优化，减少CPU和GPU之间数据传输，OS侧调优等手段提升吞吐。本项目针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的输出优化补丁。
+vLLM-ops是面向鲲鹏920新型号处理作为机头并搭载沐曦曦云C500 GPU时进行的推理性能提升，采用了CPU侧Python代码优化，减少CPU和GPU之间数据传输，OS侧调优等手段提升吞吐。本项目针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的输出优化补丁。
 
 ## 目录结构
 
@@ -49,8 +53,8 @@ vLLM-ops本身的版本说明，具体请参见《[版本说明书](./docs/zh/re
 
 ## 许可证书
 
-本项目采用Apache License 2.0，详见[LICENSE](./LICENSE)文件 
-本项目文档适用CC-BY 4.0许可证，具体请参见[LICENSE](./CC-BY)文件。
+本项目采用Apache License 2.0，详见[LICENSE](./LICENSE)文件。
+本项目文档适用CC-BY 4.0许可证，具体请参见[LICENSE](./docs/LICENSE)文件。
 
 ## 致谢
 
