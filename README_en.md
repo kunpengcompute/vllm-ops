@@ -2,11 +2,11 @@
 
 ## Latest Updates
 
-- [2026-06-30]: Based on the new Kunpeng 920 processor model, optimizes the performance based on the vLLM v0.11.0 container environment provided by MetaX.
+- [2026-06-30]: Released optimization patch collection for the community vLLM 0.11.0 and MetaX vLLM-metax 0.11.0-dev, targeting the new Kunpeng 920 processor model.
 
 ## Project Introduction
 
-vLLM-ops is a performance improvement patch repository for large language model (LLM) inference based on the new Kunpeng 920 processor model and MetaX C500. It uses Python code optimization on the CPU side to reduce data transmission between the CPU and GPU, and OS-side optimization to improve throughput. This project optimizes the performance based on the vLLM v0.11.0 container environment provided by MetaX.
+vLLM-ops is a performance improvement patch repository for large language model (LLM) inference based on the new Kunpeng 920 processor model and MetaX C500. It uses Python code optimization on the CPU side to reduce data transmission between the CPU and GPU, and OS-side optimization to improve throughput. This project provides optimization patches for the community vLLM 0.11.0 and MetaX vLLM-metax 0.11.0-dev.
 
 ## Directory Structure
 
