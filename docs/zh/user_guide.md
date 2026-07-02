@@ -73,7 +73,7 @@ payload_size > 512B
    cd /opt/conda/lib/python3.12/site-packages/
    patch -p1 < /home/code/vllm-ops/patch/0001-vllm_0.11.0-optimize-schedular.patch
    patch -p1 < /home/code/vllm-ops/patch/0002-vllm_0.11.0-optimize-sched_yield_on_arm.patch
-   ···
+   ……
    ```
 
    没有特殊回显信息，则补丁合入成功。
