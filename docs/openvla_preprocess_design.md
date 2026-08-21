@@ -319,7 +319,7 @@ flowchart TD
 
 **算法**：可分离两通道卷积（先水平后垂直），Catmull-Rom 核（a=−0.5）：
 
-```
+```text
               ┌─ |x|<1:  1.5|x|³ − 2.5|x|² + 1
 cubic(x) =    ├─ |x|<2: −0.5|x|³ + 2.5|x|² − 4|x| + 2
               └─ 其他:   0
@@ -349,7 +349,7 @@ flowchart LR
 
 **数学等价变换**——将 3 次浮点运算预计算合并为 2 次：
 
-```
+```text
 原式:   (pixel/255 − mean) / std
 合并:   pixel × scale − offset        其中 scale = 1/(255·std), offset = mean/std
 ```

@@ -16,7 +16,7 @@ OpenVLA 是机器人视觉-语言-动作模型，输入摄像头图片和自然�
 
 ## 2. 目录结构
 
-```
+```text
 ├── vllm/                             # 放入 vLLM 源码树的文件
 │   ├── csrc/cpu/
 │   │   └── openvla_image_preprocess.cpp    # NEON kernel
@@ -103,7 +103,6 @@ cd <vllm>
 pip3 install -e . --no-build-isolation
 ```
 
-
 ---
 
 ## 6. 路径约定
@@ -118,7 +117,7 @@ pip3 install -e . --no-build-isolation
 
 部署后 vLLM 源码树新增/修改的文件：
 
-```
+```text
 <vllm>/
 ├── csrc/cpu/
 │   └── openvla_image_preprocess.cpp    ← 新增
@@ -175,4 +174,3 @@ python3 edition1/e2e_verify.py
 
 - [最终技术报告](docs/openvla_preprocess_final_report.md) — 完整性能数据
 - [设计文档](docs/openvla_preprocess_design.md) — 架构和技术细节
-
