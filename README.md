@@ -1,65 +1,176 @@
-# vLLM-ops介绍
+# OpenVLA 图片前处理加速
 
-## 最新消息
+将 OpenVLA 的图片前处理管线（bicubic resize + DINOv2/SigLIP 双路归一化）从 Python (PIL+NumPy) 迁移至 ARM NEON C++ 多核实现。1920×1080 全管线从 20.16ms 降至 1.30ms，加速 **15.5×**。
 
-- [2026.06.30]：面向鲲鹏920新型号处理器，发布针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev的优化补丁合集。
+---
 
-## 项目介绍
+## 1. 项目简介
 
-vLLM-ops是面向鲲鹏920新型号处理作为机头并搭载沐曦曦云C500 GPU时进行的推理性能提升，采用了CPU侧Python代码优化，减少CPU和GPU之间数据传输，OS侧调优等手段提升吞吐。本项目针对社区版vLLM 0.11.0及沐曦版vLLM-metax 0.11.0-dev输出优化补丁。
+OpenVLA 是机器人视觉-语言-动作模型，输入摄像头图片和自然语言指令，输出机器人动作。每张图片在推理前需要经过前处理：缩放到 224×224，再做 DINOv2 和 SigLIP 双路归一化，拼成 `float32 [6, 224, 224]`。
 
-## 目录结构
+原版 vLLM 用 PIL + NumPy 实现，瓶颈在 PIL resize（单线程，占 53.6%）和 `torch.from_numpy` 拷贝（占 31.3%）。本项目将整个前处理下沉到 C++，用 ARM NEON SIMD 指令单次遍历完成所有数值计算，OpenMP 多线程并行化 resize。一次调用：`uint8 [H,W,3]` 进，`float32 [6,224,224]` 出，中间不经过 Python 解释器，不分配临时数组。
+
+详细技术说明见 `docs/openvla_preprocess_design.md`，完整数据见 `docs/openvla_preprocess_final_report.md`。
+
+---
+
+## 2. 目录结构
 
 ```text
-vllm-ops/
-├── patch                                                                    # 补丁文件目录               
-│   ├── 0001-vllm_0.11.0-optimize-schedular.patch                            
-│   ├── 0002-vllm_0.11.0-optimize-sched_yield_on_arm.patch                   
-│   ├── 0003-vllm_0.11.0-optimize-JIT.patch                                  
-│   ├── 0004-vllm_0.11.0-optimize-batch_update_np_array.patch  
-│   ├── 0005-vllm_0.11.0-refactor-extract_all_gather_for_cuda_graph.patch  
-│   ├── 0006-vllm_0.11.0-optimize-reduce_numpy_split_operations.patch                
-│   └── 0007-vllm_metax_0.11.0-dev-move_compute_to_gpu.patch
-├── docs
-|   └── zh                                                                    # 中文文档目录
-│      ├── feature_introduction.md                                            # 特性说明文档
-│      ├── menu_vllm_ops.md                                                   # 文档指南
-│      ├── release_notes.md                                                   # 每个发布版本的基础信息和特性更新信息
-│      └── user_guide.md                                                      # 用户指南
-├── LICENSE                                                                   # 开源许可证文件
-├── CC-BY                                                                     # 开源文档许可证文件
-└── README.md                                                                 # 项目说明文档
+├── vllm/                             # 放入 vLLM 源码树的文件
+│   ├── csrc/cpu/
+│   │   └── openvla_image_preprocess.cpp    # NEON kernel
+│   └── vllm/transformers_utils/processors/
+│       └── openvla.py                      # Python dispatch
+│
+├── deploy.sh                         # 一键部署脚本
+├── test_openvla_kernel.py            # 端到端测试
+│
+├── docs/                             # 技术文档
+│   ├── openvla_preprocess_design.md       # 设计文档（架构与技术细节）
+│   ├── openvla_preprocess_final_report.md # 最终技术报告
+│   └── figures/                           # 架构图（PNG 格式）
+│       ├── data_layout_transform.png
+│       ├── dataflow_diff.png
+│       └── neon_normalize.png
+│
+└── workplace/                        # 独立验证脚本（不依赖 vLLM）
+    ├── openvla_preprocess_pipeline.py     # 完整参考流水线
+    ├── lib_preprocess.cpp                # 独立 .so 版本
+    └── edition1/                          # 测试套件
 ```
 
-## 版本说明
+---
 
-vLLM-ops本身的版本说明，具体请参见《[版本说明书](./docs/zh/release_notes.md)》。
+## 3. 环境要求
 
-## 学习文档
+| 项目 | 最低 | 推荐 |
+|------|------|------|
+| CPU | ARM aarch64 + NEON | Huawei Kunpeng 920|
+| 操作系统 | Linux (aarch64) | openEuler 24.03|
+| 编译器 | GCC 10+ | GCC 12+, `-march=armv8.2-a+fp16+dotprod` |
+| Python | 3.10+ | 3.11 |
+| 依赖 | `numactl-devel`, `ninja` | — |
 
-|  资源名称 |资源简介   |
-| ------------ | ------------ |
-| [版本说明书](./docs/zh/release_notes.md)  | 提供vLLM-ops每个发布版本的基础信息和特性更新信息。  |
-|  [特性介绍](./docs/zh/feature_introduction.md) |  提供vLLM-ops优化说明。 |
-|  [用户指南](./docs/zh/user_guide.md) |  提供vLLM-ops优化使用说明。 |
+x86 / macOS 走标量 fallback，功能正常但无 NEON 加速。
 
-## 贡献声明
+---
 
-欢迎大家为社区做贡献，如果使用过程中有任何问题/建议，或者需要反馈特性需求和bug报告，可以提交issues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。同时也欢迎大家在[讨论专区](https://gitcode.com/boostkit/community/discussions)展开讨论交流。感谢您的支持。
+## 4. 运行前检查清单
 
-## 免责声明
+- [ ] **ARM 架构**：`uname -m` 应输出 `aarch64`
+- [ ] **编译器支持 NEON**：`gcc -march=armv8.2-a+fp16+dotprod -E - < /dev/null` 无报错
+- [ ] **numactl-devel 已安装**：`rpm -q numactl-devel` 或 `dpkg -l | grep numactl`
+- [ ] **ninja 已安装**：`which ninja`
+- [ ] **vLLM 源码已克隆**：`git clone https://github.com/vllm-project/vllm.git`
 
-此代码仓计划参与vLLM和vLLM-metax开源组件，编码风格遵照原生开源软件，继承原生开源软件安全设计，不破坏原生开源软件设计及编码风格和方式，软件的任何漏洞与安全问题，均由相应的上游社区根据其漏洞和安全响应机制解决。请密切关注上游社区发布的通知和版本更新。鲲鹏计算社区对软件的漏洞及安全问题不承担任何责任。
+---
 
-## 许可证书
+## 5. 快速开始
 
-本项目采用Apache License 2.0，详见[LICENSE](./LICENSE)文件。
-本项目文档适用CC-BY 4.0许可证，具体请参见[LICENSE](./docs/LICENSE)文件。
+### 方式一：自动化部署
 
-## 致谢
+```bash
+cd <本项目根目录>
+bash deploy.sh <vLLM源码目录>
 
-vLLM-ops由华为公司的下列部门联合贡献：
+# 例如: bash deploy.sh /home/user/vllm
+```
 
-鲲鹏计算Boostkit开发部
+`deploy.sh` 自动完成文件复制和 cmake 补丁。
 
-感谢来自社区的每一个PR，欢迎贡献vLLM-ops！
+### 方式二：手动部署
+
+**① 复制文件**
+
+```bash
+cp vllm/csrc/cpu/openvla_image_preprocess.cpp <vllm>/csrc/cpu/
+cp vllm/vllm/transformers_utils/processors/openvla.py <vllm>/vllm/transformers_utils/processors/
+```
+
+**② 修改 cmake**
+
+在 `<vllm>/cmake/cpu_extension.cmake` 中找到 `"csrc/cpu/shm.cpp"` 一行，其后追加：
+
+```cmake
+        "csrc/cpu/openvla_image_preprocess.cpp"
+```
+
+**③ 编译**
+
+```bash
+cd <vllm>
+pip3 install -e . --no-build-isolation
+```
+
+---
+
+## 6. 路径约定
+
+| 占位符 | 含义 | 示例 |
+|--------|------|------|
+| `<本项目根目录>` | 本项目的根目录 | `/home/user/openvla_preprocess` |
+| `<vllm>` | vLLM 源码根目录 | `/home/user/vllm` |
+| `<vllm>/csrc/cpu/` | vLLM C++ CPU 扩展目录 | `/home/user/vllm/csrc/cpu/` |
+| `<vllm>/vllm/.../processors/` | vLLM processors 目录 | `/home/user/vllm/vllm/transformers_utils/processors/` |
+| `<vllm>/cmake/cpu_extension.cmake` | vLLM CPU 扩展 cmake | `/home/user/vllm/cmake/cpu_extension.cmake` |
+
+部署后 vLLM 源码树新增/修改的文件：
+
+```text
+<vllm>/
+├── csrc/cpu/
+│   └── openvla_image_preprocess.cpp    ← 新增
+├── cmake/
+│   └── cpu_extension.cmake            ← 追加一行
+└── vllm/transformers_utils/processors/
+    └── openvla.py                      ← 替换
+```
+
+---
+
+## 7. 测试验证方式
+
+### 集成测试
+
+```bash
+python3 test_openvla_kernel.py
+```
+
+预期：16 项全部通过。
+
+### 性能基准
+
+```bash
+python3 test_openvla_kernel.py --bench
+```
+
+### 手动验证算子已注册
+
+```bash
+python3 -c "
+from vllm.transformers_utils.processors.openvla import preprocess_openvla_image
+import torch
+print(torch.ops._C.openvla_fused_preprocess)
+"
+```
+
+> 必须 import `openvla` 模块才能触发算子注册（`import vllm` 不会自动加载 processor）。
+
+预期输出包含 `_C.openvla_fused_preprocess`。报 AttributeError 则算子注册失败（走 Python fallback）。
+
+### 独立验证（不依赖 vLLM）
+
+```bash
+cd workplace
+g++ -std=c++14 -march=armv8.2-a+fp16+dotprod -fopenmp -O3 -shared -fPIC \
+    -o libpreprocess.so lib_preprocess.cpp
+python3 edition1/e2e_verify.py
+```
+
+---
+
+## 参考
+
+- [最终技术报告](docs/openvla_preprocess_final_report.md) — 完整性能数据
+- [设计文档](docs/openvla_preprocess_design.md) — 架构和技术细节
