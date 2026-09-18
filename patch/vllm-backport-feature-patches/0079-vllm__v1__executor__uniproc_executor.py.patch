@@ -1,0 +1,22 @@
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index 3759c751c76de0d34f787396c9bb709c89d29cc9..0891a1478e88853b508f72ff7dad8f5dbc548fd0 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -98,12 +98,16 @@ class UniProcExecutor(Executor):
+     def execute_model(  # type: ignore[override]
+         self, scheduler_output: SchedulerOutput, non_block: bool = False
+     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+-        return self.collective_rpc(
++        output = self.collective_rpc(
+             "execute_model",
+             args=(scheduler_output,),
+             non_block=non_block,
+             single_value=True,
+         )
++        # Surface failures early when the non-blocking future is already done.
++        if non_block and output.done():
++            output.result()
++        return output
+ 
+     def sample_tokens(  # type: ignore[override]
+         self, grammar_output: GrammarOutput | None, non_block: bool = False

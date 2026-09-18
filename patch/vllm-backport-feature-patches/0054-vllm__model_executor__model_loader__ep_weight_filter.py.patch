@@ -1,0 +1,61 @@
+diff --git a/vllm/model_executor/model_loader/ep_weight_filter.py b/vllm/model_executor/model_loader/ep_weight_filter.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cffc3121c0952dea6e655433bc715f00bae6e3ed
+--- /dev/null
++++ b/vllm/model_executor/model_loader/ep_weight_filter.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Filter out non-local expert weights during model loading."""
++
++import re
++
++_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
++
++
++def parse_expert_id(weight_name: str) -> int | None:
++    """Return the expert id embedded in a per-expert weight name."""
++    match = _EXPERT_ID_RE.search(weight_name)
++    return int(match.group(1)) if match else None
++
++
++def compute_local_expert_ids(
++    num_experts: int,
++    ep_size: int,
++    ep_rank: int,
++    placement: str = "linear",
++) -> set[int] | None:
++    """Compute global expert ids owned by an expert-parallel rank."""
++    if ep_size <= 1:
++        return None
++
++    if placement == "linear":
++        base = num_experts // ep_size
++        remainder = num_experts % ep_size
++        start = ep_rank * base + min(ep_rank, remainder)
++        local_count = base + (1 if ep_rank < remainder else 0)
++        return set(range(start, start + local_count))
++    if placement == "round_robin":
++        return set(range(ep_rank, num_experts, ep_size))
++
++    raise ValueError(f"Unknown expert placement strategy: {placement}")
++
++
++def should_skip_weight(
++    weight_name: str,
++    local_expert_ids: set[int] | None,
++) -> bool:
++    """Return True if a non-local per-expert weight should be skipped."""
++    if local_expert_ids is None:
++        return False
++
++    expert_id = parse_expert_id(weight_name)
++    if expert_id is None:
++        return False
++
++    # Keep scale/metadata tensors from all experts. They are tiny, and some
++    # backends need cross-expert scale data for correctness.
++    if not weight_name.endswith(".weight"):
++        return False
++
++    return expert_id not in local_expert_ids

@@ -1,0 +1,13 @@
+diff --git a/benchmarks/kernels/cpu/benchmark_cpu_attn.py b/benchmarks/kernels/cpu/benchmark_cpu_attn.py
+index d03b70a9f5034ab74efbfebda83d2f7e31bb4874..63d034278c7e077d30e80e52d4cc754528896682 100644
+--- a/benchmarks/kernels/cpu/benchmark_cpu_attn.py
++++ b/benchmarks/kernels/cpu/benchmark_cpu_attn.py
+@@ -27,7 +27,7 @@ def get_attn_isa(
+     else:
+         if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
+             return "neon"
+-        elif torch._C._cpu._is_amx_tile_supported():
++        elif torch.cpu._is_amx_tile_supported():
+             return "amx"
+         else:
+             return "vec"

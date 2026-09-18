@@ -1,0 +1,152 @@
+diff --git a/tests/model_executor/model_loader/test_ep_weight_filter.py b/tests/model_executor/model_loader/test_ep_weight_filter.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa31f117ec4e979739f5f9028f586779b14bc798
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_ep_weight_filter.py
+@@ -0,0 +1,146 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for EP weight filtering during model loading."""
++
++import pytest
++import torch
++
++from vllm.model_executor.model_loader.ep_weight_filter import (
++    compute_local_expert_ids,
++    parse_expert_id,
++    should_skip_weight,
++)
++from vllm.model_executor.model_loader.weight_utils import safetensors_weights_iterator
++
++
++class TestParseExpertId:
++    def test_routed_expert(self):
++        assert parse_expert_id("model.layers.0.mlp.experts.42.gate_proj.weight") == 42
++
++    def test_non_expert_weights(self):
++        assert parse_expert_id("model.layers.0.self_attn.q_proj.weight") is None
++        assert parse_expert_id("model.embed_tokens.weight") is None
++        assert parse_expert_id("model.layers.0.mlp.shared_experts.weight") is None
++        assert parse_expert_id("model.layers.0.mlp.experts.gate_proj.weight") is None
++
++    def test_scale_tensor(self):
++        assert (
++            parse_expert_id("model.layers.5.mlp.experts.100.gate_proj.weight_scale")
++            == 100
++        )
++
++
++class TestComputeLocalExpertIds:
++    def test_ep_disabled(self):
++        assert compute_local_expert_ids(64, ep_size=1, ep_rank=0) is None
++
++    def test_linear_even_split(self):
++        assert compute_local_expert_ids(64, ep_size=8, ep_rank=0) == set(range(0, 8))
++        assert compute_local_expert_ids(64, ep_size=8, ep_rank=7) == set(range(56, 64))
++
++    def test_linear_uneven_split(self):
++        ids_0 = compute_local_expert_ids(10, ep_size=3, ep_rank=0)
++        ids_1 = compute_local_expert_ids(10, ep_size=3, ep_rank=1)
++        ids_2 = compute_local_expert_ids(10, ep_size=3, ep_rank=2)
++
++        assert ids_0 == {0, 1, 2, 3}
++        assert ids_1 == {4, 5, 6}
++        assert ids_2 == {7, 8, 9}
++
++    def test_round_robin(self):
++        ids_0 = compute_local_expert_ids(10, 3, 0, placement="round_robin")
++        ids_1 = compute_local_expert_ids(10, 3, 1, placement="round_robin")
++        ids_2 = compute_local_expert_ids(10, 3, 2, placement="round_robin")
++
++        assert ids_0 == {0, 3, 6, 9}
++        assert ids_1 == {1, 4, 7}
++        assert ids_2 == {2, 5, 8}
++
++    def test_unknown_placement(self):
++        with pytest.raises(ValueError, match="Unknown expert placement strategy"):
++            compute_local_expert_ids(8, 2, 0, placement="bad")
++
++
++class TestShouldSkipWeight:
++    def setup_method(self):
++        self.local_ids = compute_local_expert_ids(8, ep_size=2, ep_rank=0)
++
++    def test_no_filter(self):
++        assert not should_skip_weight("model.layers.0.mlp.experts.7.weight", None)
++
++    def test_dense_and_shared_weights_are_kept(self):
++        assert not should_skip_weight("model.embed_tokens.weight", self.local_ids)
++        assert not should_skip_weight(
++            "model.layers.0.mlp.shared_experts.gate_proj.weight", self.local_ids
++        )
++        assert not should_skip_weight(
++            "model.layers.0.mlp.experts.gate_proj.weight", self.local_ids
++        )
++
++    def test_local_and_remote_expert_weights(self):
++        assert not should_skip_weight(
++            "model.layers.0.mlp.experts.3.gate_proj.weight", self.local_ids
++        )
++        assert should_skip_weight(
++            "model.layers.0.mlp.experts.4.gate_proj.weight", self.local_ids
++        )
++
++    def test_scale_tensors_are_kept(self):
++        assert not should_skip_weight(
++            "model.layers.0.mlp.experts.7.gate_proj.weight_scale", self.local_ids
++        )
++
++
++class TestSafetensorsWeightsIteratorWithEpFilter:
++    @pytest.fixture
++    def synthetic_moe_files(self, tmp_path):
++        from safetensors.torch import save_file
++
++        tensors = {
++            "model.embed_tokens.weight": torch.randn(8, 4),
++            "model.layers.0.self_attn.q_proj.weight": torch.randn(4, 4),
++            "model.layers.0.mlp.shared_experts.gate_proj.weight": torch.randn(4, 4),
++        }
++        for expert_id in range(8):
++            tensors[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = (
++                torch.randn(4, 4)
++            )
++            tensors[f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight_scale"] = (
++                torch.randn(1)
++            )
++
++        path = str(tmp_path / "model.safetensors")
++        save_file(tensors, path)
++        return [path], tensors
++
++    def test_no_filter_returns_all(self, synthetic_moe_files):
++        files, expected = synthetic_moe_files
++        loaded = dict(safetensors_weights_iterator(files, False))
++        assert set(loaded) == set(expected)
++
++    def test_filter_skips_only_remote_expert_weights(self, synthetic_moe_files):
++        files, expected = synthetic_moe_files
++        local_ids = compute_local_expert_ids(8, ep_size=2, ep_rank=0)
++        loaded = dict(
++            safetensors_weights_iterator(files, False, local_expert_ids=local_ids)
++        )
++
++        assert "model.embed_tokens.weight" in loaded
++        assert "model.layers.0.self_attn.q_proj.weight" in loaded
++        assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in loaded
++
++        expert_weights = [
++            name
++            for name in loaded
++            if parse_expert_id(name) is not None and name.endswith(".weight")
++        ]
++        expert_scales = [
++            name
++            for name in loaded
++            if parse_expert_id(name) is not None and name.endswith("weight_scale")
++        ]
++        assert len(expert_weights) == 4
++        assert len(expert_scales) == 8
++        for name in expert_weights:
++            assert parse_expert_id(name) in local_ids
++            assert torch.equal(loaded[name], expected[name])

@@ -1,0 +1,13 @@
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index cfaa37074d9e53f14c16c10e4da0a1503336a17e..2ed7ef7e08e55c3860119dc2982ff712104c54de 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -106,7 +106,7 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
+         NONE_HASH = BlockHash(hash_fn(hash_seed))
+ 
+ 
+-@dataclass
++@dataclass(slots=True)
+ class KVCacheBlock:
+     """KV-cache block metadata."""
+ 

@@ -1,0 +1,26 @@
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index 85232e9185f53123c50463c027ddecd04068d174..f9d444a011f7ddcffe4b5637c7094120a3a7dec6 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -143,6 +143,10 @@ class AnthropicServingMessages(OpenAIServingChat):
+             system_prompt = ""
+             for block in anthropic_request.system:
+                 if block.type == "text" and block.text:
++                    # Strip Claude Code's attribution header which contains
++                    # a per-request hash that defeats prefix caching.
++                    if block.text.startswith("x-anthropic-billing-header"):
++                        continue
+                     system_prompt += block.text
+             openai_messages.append({"role": "system", "content": system_prompt})
+ 
+@@ -215,6 +219,10 @@ class AnthropicServingMessages(OpenAIServingChat):
+             content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+         elif block.type == "thinking" and block.thinking is not None:
+             reasoning_parts.append(block.thinking)
++        elif block.type == "redacted_thinking":
++            # Redacted thinking blocks contain opaque safety-filtered reasoning.
++            # Accept and ignore them when clients echo full assistant messages.
++            pass
+         elif block.type == "tool_use":
+             cls._convert_tool_use_block(block, tool_calls)
+         elif block.type == "tool_result":

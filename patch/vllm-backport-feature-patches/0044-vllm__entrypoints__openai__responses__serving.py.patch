@@ -1,0 +1,38 @@
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 3cfb6fffc3ea806f941c7fa62aee0937b727dc72..6c53af640d512b832877b1e4fb87569ebef5abdf 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -1108,7 +1108,7 @@ class OpenAIServingResponses(OpenAIServing):
+                 prev_outputs = []
+             for response_msg in request.input:
+                 new_msg = response_input_to_harmony(response_msg, prev_outputs)
+-                if new_msg.author.role != "system":
++                if new_msg is not None and new_msg.author.role != "system":
+                     messages.append(new_msg)
+ 
+                 # User passes in a tool call request and its output. We need
+@@ -1401,6 +1401,24 @@ class OpenAIServingResponses(OpenAIServing):
+                         for pm in previous_delta_messages
+                         if pm.reasoning is not None
+                     )
++
++                    # delta message could have both reasoning and content.
++                    # Include current delta's reasoning in the finalization
++                    # because it may carry the tail end of reasoning text.
++                    if delta_message.reasoning is not None:
++                        yield _increment_sequence_number_and_return(
++                            ResponseReasoningTextDeltaEvent(
++                                type="response.reasoning_text.delta",
++                                sequence_number=-1,
++                                content_index=current_content_index,
++                                output_index=current_output_index,
++                                item_id=current_item_id,
++                                delta=delta_message.reasoning,
++                            )
++                        )
++                        reason_content += delta_message.reasoning
++                        delta_message = DeltaMessage(content=delta_message.content)
++
+                     yield _increment_sequence_number_and_return(
+                         ResponseReasoningTextDoneEvent(
+                             type="response.reasoning_text.done",

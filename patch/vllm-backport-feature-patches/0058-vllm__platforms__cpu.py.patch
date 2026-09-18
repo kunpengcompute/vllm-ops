@@ -1,0 +1,15 @@
+diff --git a/vllm/platforms/cpu.py b/vllm/platforms/cpu.py
+index 421cf8797f2ca476a76e6f0c206ca011be572f90..fc1b4e2909ca73830001273c39f83fb060aa52a5 100644
+--- a/vllm/platforms/cpu.py
++++ b/vllm/platforms/cpu.py
+@@ -367,7 +367,9 @@ class CpuPlatform(Platform):
+ 
+         # Init LogicalCPUInfo from lscpu
+         lscpu_output = subprocess.check_output(
+-            "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
++            "lscpu --json --extended=CPU,CORE,NODE --online",
++            shell=True,
++            text=True,
+         )
+         lscpu_output = re.sub(r'"node":\s*-\s*(,|\n)', r'"node": 0\1', lscpu_output)
+         logical_cpu_list: list[LogicalCPUInfo] = json.loads(

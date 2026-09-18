@@ -1,0 +1,26 @@
+diff --git a/vllm/entrypoints/openai/server_utils.py b/vllm/entrypoints/openai/server_utils.py
+index 12768cb6f97cc73148c18d107886846c1df1024a..d5d6f4d03bb7c240670fa4631d063d183f3074b3 100644
+--- a/vllm/entrypoints/openai/server_utils.py
++++ b/vllm/entrypoints/openai/server_utils.py
+@@ -21,7 +21,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+ from vllm import envs
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+-from vllm.entrypoints.utils import sanitize_message
++from vllm.entrypoints.openai.engine.serving import GenerationError
++from vllm.entrypoints.utils import create_error_response, sanitize_message
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.utils.gc_utils import freeze_gc_heap
+@@ -349,6 +350,11 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
+     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
++async def generation_error_handler(_: Request, exc: GenerationError):
++    err = create_error_response(exc)
++    return JSONResponse(err.model_dump(), status_code=err.error.code)
++
++
+ _running_tasks: set[asyncio.Task] = set()
+ 
+ 

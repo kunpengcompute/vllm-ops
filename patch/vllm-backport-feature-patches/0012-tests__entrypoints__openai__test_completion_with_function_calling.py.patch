@@ -1,0 +1,28 @@
+diff --git a/tests/entrypoints/openai/test_completion_with_function_calling.py b/tests/entrypoints/openai/test_completion_with_function_calling.py
+index c6a5841ec3bfb3ca812f418447a94be84bd797bd..3cbb3f38c188f0ba2a42d7f21a93737d13a30eff 100644
+--- a/tests/entrypoints/openai/test_completion_with_function_calling.py
++++ b/tests/entrypoints/openai/test_completion_with_function_calling.py
+@@ -484,3 +484,23 @@ async def test_inconsistent_tool_choice_and_tools(
+             ],
+             tool_choice={},
+         )
++
++
++@pytest.mark.asyncio
++async def test_max_tokens_with_tool_choice_required(client: openai.AsyncOpenAI):
++    models = await client.models.list()
++    model_name: str = models.data[0].id
++
++    chat_completion = await client.chat.completions.create(
++        messages=messages,
++        temperature=0,
++        max_completion_tokens=1,
++        model=model_name,
++        tools=tools,
++        tool_choice="required",
++    )
++
++    choice = chat_completion.choices[0]
++    assert choice.finish_reason == "length"
++    assert len(choice.message.tool_calls) == 0
++    assert choice.message.content == ""

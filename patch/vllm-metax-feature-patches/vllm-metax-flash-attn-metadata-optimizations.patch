@@ -1,0 +1,66 @@
+vLLM-MetaX: reduce Flash Attention metadata overhead
+
+Base: vLLM-MetaX v0.17.0 (14d1f8889bf08c3a368f572d885d04f95ea88dfb)
+Result-Tree: fdc9fc6d847e624dad59fd0e6106f5619e16abdc
+Target: vllm_metax/v1/attention/backends/flash_attn.py
+
+Feature 1:
+Use the existing batch max_seq_len as a safe prefill upper bound instead of
+prefill_seq_lens.max().item(). This removes a device-to-host scalar sync and
+the associated mcStreamSynchronize wait from metadata construction.
+
+Feature 2:
+Do not precompute cu_seqlens_k in the Non-DCP metadata path. The forward path
+rebuilds the value from seq_lens before invoking Flash Attention, so the old
+zero_/to/pad/cumsum work was redundant GPU kernel and launch overhead.
+
+Scope:
+The DCP path is unchanged. The patch changes metadata preparation only and
+does not modify MetaX kernels, Flash Attention kernel inputs, or mcoplib APIs.
+Inline comments are included beside both optimizations.
+
+---
+diff --git a/vllm_metax/v1/attention/backends/flash_attn.py b/vllm_metax/v1/attention/backends/flash_attn.py
+index 94e5807b0e98c2f0ee74b57d76b143d0687c68b0..5ad895911c73f6ff60eaf578916ddf3309f0496c 100644
+--- a/vllm_metax/v1/attention/backends/flash_attn.py
++++ b/vllm_metax/v1/attention/backends/flash_attn.py
+@@ -489,7 +489,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+                 - common_attn_metadata.query_start_loc[num_decodes]
+             )
+             prefill_seq_lens = common_attn_metadata.seq_lens[num_decodes:num_reqs]
+-            prefill_max_seq_len = int(prefill_seq_lens.max().item())
++            # Use the existing batch max as a safe upper bound to avoid a
++            # device-to-host sync from prefill_seq_lens.max().item().
++            prefill_max_seq_len = max_seq_len
+             prefill_block_table_tensor = common_attn_metadata.block_table_tensor[
+                 num_decodes:num_reqs
+             ]
+@@ -618,25 +620,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+                 causal=causal,
+             )
+ 
+-            # --------------------------------------------------------------
+-            # Note: Precompute cu_seqlens_k (prefix sums over KV lengths) on GPU.
+-            # This replaces any forward-time construction that would require
+-            # CPU sync (e.g. via .tolist()), which breaks CUDA graph capture.
+-            if self.use_full_cuda_graph:
+-                if self._cu_seqlens_k_buffer is not None:
+-                    n = num_reqs + 1
+-                    buf = self._cu_seqlens_k_buffer
+-                    # Leading 0, then inclusive cumsum into buf[1:n].
+-                    buf[0].zero_()
+-                    seq_lens_i32 = seq_lens[:num_reqs].to(dtype=torch.int32)
+-                    torch.cumsum(seq_lens_i32, dim=0, dtype=torch.int32, out=buf[1:n])
+-                    cu_seqlens_k = buf[:n]
+-                else:
+-                    cu_seqlens_k = F.pad(
+-                        seq_lens[:num_reqs],
+-                        (1, 0),
+-                        value=0,
+-                    ).cumsum(dim=0, dtype=torch.int32)
++            # Non-DCP forward rebuilds cu_seqlens_k from seq_lens immediately
++            # before the Flash Attention call, so leave the metadata value as
++            # None here and avoid redundant zero_/to/pad/cumsum GPU kernels.
+ 
+         # For FA3 + full cudagraph
+         if self.use_full_cuda_graph and scheduler_metadata is not None:

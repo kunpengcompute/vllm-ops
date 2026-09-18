@@ -1,0 +1,12 @@
+diff --git a/tests/entrypoints/openai/test_lora_resolvers.py b/tests/entrypoints/openai/test_lora_resolvers.py
+index 0988ff64486bd6fa8b806246e2729b7e546c8d7b..129733d23cfda6a727c2b9f64a307ee5e132329d 100644
+--- a/tests/entrypoints/openai/test_lora_resolvers.py
++++ b/tests/entrypoints/openai/test_lora_resolvers.py
+@@ -53,6 +53,7 @@ class MockModelConfig:
+     skip_tokenizer_init: bool = False
+     is_encoder_decoder: bool = False
+     is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
+ 
+     def get_diff_sampling_param(self):
+         return self.diff_sampling_param or {}

@@ -1,47 +1,56 @@
-# Introduction to vLLM-ops
+# Introduction to vLLM High-Version Feature Backport
+
+English|[简体中文](./README.md)
 
 ## Latest Updates
 
-- [2026-06-30]: Released optimization patch collection for the community vLLM 0.11.0 and MetaX vLLM-metax 0.11.0-dev, targeting the new Kunpeng 920 processor model.
+- [2026-09-30]: Released a patch collection for the inference scenario on the MetaX C500 GPU. Based on the vLLM 0.15.0 container, it compiles vLLM 0.17.0 and vLLM-MetaX 0.17.0 from source and backports the core performance optimization features of vLLM 0.18.0, 0.19.0, and 0.20.0.
+- [2026-06-30]: Released an optimization patch collection for community edition vLLM 0.11.0 and MetaX edition vLLM-MetaX 0.11.0-dev.
 
 ## Project Introduction
 
-vLLM-ops is a performance improvement patch repository for large language model (LLM) inference based on the new Kunpeng 920 processor model and MetaX C500. It uses Python code optimization on the CPU side to reduce data transmission between the CPU and GPU, and OS-side optimization to improve throughput. This project provides optimization patches for the community vLLM 0.11.0 and MetaX vLLM-metax 0.11.0-dev.
+The vLLM High-Version Feature Backport project targets the inference scenario on the MetaX C500 GPU. It uses the vLLM 0.15.0 container provided by MetaX as the base environment, compiles vLLM 0.17.0 and vLLM-MetaX 0.17.0 from source inside the container, backports 38 feature points from vLLM 0.18.0, 0.19.0, and 0.20.0 to eliminate the performance disadvantages caused by version lag, and additionally applies opt optimizations and vLLM-MetaX FlashAttention metadata optimizations to further improve inference performance.
 
 ## Directory Structure
 
 ```text
 vllm-ops/
-├── patch                                                                    # Patch file directory              
-│   ├── 0001-vllm_0.11.0-optimize-schedular.patch                            
-│   ├── 0002-vllm_0.11.0-optimize-sched_yield_on_arm.patch                   
-│   ├── 0003-vllm_0.11.0-optimize-JIT.patch                                  
-│   ├── 0004-vllm_0.11.0-optimize-batch_update_np_array.patch  
-│   ├── 0005-vllm_0.11.0-refactor-extract_all_gather_for_cuda_graph.patch  
-│   ├── 0006-vllm_0.11.0-optimize-reduce_numpy_split_operations.patch                
-│   └── 0007-vllm_metax_0.11.0-dev-move_compute_to_gpu.patch
+├── patch                                                                           # Patch file directory
+│   ├── vllm-backport-feature-patches                                               # Main high-version feature backport patch package
+│   │   ├── 0001-benchmarks__kernels__cpu__benchmark_cpu_attn.py.patch
+│   │   ├── ...                                                                      # File-level backport patches 0002 to 0084
+│   │   ├── 0085-vllm__v1__worker__gpu_ubatch_wrapper.py.patch
+│   │   ├── manifest.csv                                                            # Mapping between patches and source files
+│   │   ├── series                                                                  # Patch application order
+│   │   └── README.md                                                               # Main patch package description
+│   ├── vllm-opt-patch                                                              # Standalone vLLM opt optimization patch package
+│   │   ├── vllm-0.17.0-opt.patch                                                   # greedy sampler and block table merge patch
+│   │   └── README.md                                                               # opt patch package description
+│   └── vllm-metax-feature-patches                                                  # vLLM-MetaX optimization patch package
+│       ├── vllm-metax-flash-attn-metadata-optimizations.patch                      # FlashAttention metadata optimization patch
+│       └── README.md                                                               # vLLM-MetaX patch package description
 ├── docs
-|   └── en                                                                    # English document directory
-│      ├── feature_introduction.md                                            # Feature description document
-│      ├── menu_vllm_ops.md                                                   # Document guide
-│      ├── release_notes.md                                                   # Basic information and feature updates of each release version
-│      └── user_guide.md                                                      # User Guide
-├── LICENSE                                                                   # Open-source license file
-├── CC-BY                                                                     # Open-source document license file
-└── README_en.md                                                              # Project introduction
+│   └── en                                                                          # English document directory
+│       ├── feature_introduction.md                                                 # Feature description
+│       ├── menu_vllm_ops.md                                                         # Document guide
+│       ├── release_notes.md                                                         # Release Notes
+│       └── user_guide.md                                                           # User Guide
+├── LICENSE                                                                         # Open-source license file
+├── CC-BY                                                                           # Open-source document license file
+└── README_en.md                                                                    # Project introduction
 ```
 
 ## Release Notes
 
-For details about the vLLM-ops version description, see [Release Notes](./docs/en/release_notes.md).
+For details about the version description, see [Release Notes](./docs/en/release_notes.md).
 
 ## Documents
 
-|  Document Name|Description  |
+| Document Name | Description |
 | ------------ | ------------ |
-| [Release Notes](./docs/en/release_notes.md) | Provides basic information and feature updates of each vLLM-ops version. |
-|  [Feature Introduction](./docs/en/feature_introduction.md)|  Provides vLLM-ops optimization description.|
-|  [User Guide](./docs/en/user_guide.md)|  Provides vLLM-ops optimization usage description.|
+| [Release Notes](./docs/en/release_notes.md) | Provides basic information and feature updates of each release version. |
+| [Feature Introduction](./docs/en/feature_introduction.md) | Provides the description of the high-version feature backport and optimizations. |
+| [User Guide](./docs/en/user_guide.md) | Provides the usage description of the backport patches. |
 
 ## Contribution Statement
 
@@ -49,7 +58,7 @@ We welcome your contributions to the community. If you have any questions/sugges
 
 ## Disclaimer
 
-This code repository contributes to the vLLM and vLLM-metax open-source components. It strictly adheres to the coding style and methods, as well as security design of the native open-source software. Any vulnerability and security issues of the software shall be resolved by the corresponding upstream communities according to their response mechanisms. Please pay attention to the notifications and version updates released by the upstream communities. The Kunpeng computing community does not assume any responsibility for software vulnerabilities and security issues.
+This code repository contributes to the vLLM and vLLM-MetaX open-source components. It strictly adheres to the coding style and methods, as well as security design of the native open-source software. Any vulnerability and security issues of the software shall be resolved by the corresponding upstream communities according to their response mechanisms. Please pay attention to the notifications and version updates released by the upstream communities. This project does not assume any responsibility for software vulnerabilities and security issues.
 
 ## License
 
@@ -58,8 +67,4 @@ The documents of this project are licensed under CC-BY 4.0. For details, see [LI
 
 ## Acknowledgments
 
-vLLM-ops is jointly developed by the following Huawei department:
-
-Kunpeng Computing BoostKit Development Dept
-
-Thank you to everyone in the community for your PRs. We warmly welcome contributions to vLLM-ops!
+Thank you to everyone in the community for your PRs. We warmly welcome contributions!

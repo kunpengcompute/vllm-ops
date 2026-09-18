@@ -1,0 +1,78 @@
+diff --git a/tests/entrypoints/openai/parser/test_harmony_utils.py b/tests/entrypoints/openai/parser/test_harmony_utils.py
+index 7842a1fcd75770da965232a19dcf28ad70410980..d7b649fa50f817a7d3975abc544c9b2d337205b1 100644
+--- a/tests/entrypoints/openai/parser/test_harmony_utils.py
++++ b/tests/entrypoints/openai/parser/test_harmony_utils.py
+@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
+     parse_chat_output,
+ )
+ from vllm.entrypoints.openai.responses.harmony import (
++    response_input_to_harmony,
+     response_previous_input_to_harmony,
+ )
+ 
+@@ -841,3 +842,65 @@ class TestGetSystemMessage:
+                 assert channel in valid_channels, (
+                     f"{channel} missing when with_custom_tools={with_tools}"
+                 )
++
++
++class TestResponseInputToHarmonyReasoningItem:
++    def test_reasoning_with_single_content(self):
++        item = {
++            "type": "reasoning",
++            "id": "rs_123",
++            "content": [{"type": "reasoning_text", "text": "Thinking step by step"}],
++        }
++
++        msg = response_input_to_harmony(item, prev_responses=[])
++
++        assert msg is not None
++        assert msg.author.role == Role.ASSISTANT
++        assert msg.content[0].text == "Thinking step by step"
++        assert msg.channel == "analysis"
++
++    def test_reasoning_with_multiple_content_items(self):
++        item = {
++            "type": "reasoning",
++            "id": "rs_123",
++            "content": [
++                {"type": "reasoning_text", "text": "First"},
++                {"type": "reasoning_text", "text": "Second"},
++                {"type": "reasoning_text", "text": "Finally"},
++            ],
++        }
++
++        msg = response_input_to_harmony(item, prev_responses=[])
++
++        assert msg is not None
++        assert msg.author.role == Role.ASSISTANT
++        assert msg.content[0].text == "First\nSecond\nFinally"
++        assert msg.channel == "analysis"
++
++    def test_reasoning_without_content_returns_none(self):
++        item = {
++            "type": "reasoning",
++            "id": "rs_123",
++            "summary": [{"type": "summary_text", "text": "Thinking"}],
++        }
++
++        assert response_input_to_harmony(item, prev_responses=[]) is None
++
++    def test_reasoning_with_none_content_returns_none(self):
++        item = {
++            "type": "reasoning",
++            "id": "rs_123",
++            "content": None,
++            "summary": [{"type": "summary_text", "text": "Thinking"}],
++        }
++
++        assert response_input_to_harmony(item, prev_responses=[]) is None
++
++    def test_reasoning_with_empty_content_returns_none(self):
++        item = {
++            "type": "reasoning",
++            "id": "rs_123",
++            "content": [],
++        }
++
++        assert response_input_to_harmony(item, prev_responses=[]) is None
