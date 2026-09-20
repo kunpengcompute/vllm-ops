@@ -34,10 +34,9 @@ OpenVLA 图片前处理独立流水线 — 从 vLLM 中提取, 供优化验证�
 from __future__ import annotations
 
 import argparse
-import time
 import sys
+import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -60,14 +59,15 @@ NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2  # 256
 # 预计算常量, 用于 fused kernel 优化
 INV_255 = np.float32(1.0 / 255.0)
 IMAGENET_MEAN_DIV_STD = IMAGENET_MEAN / IMAGENET_STD  # (3,)
-IMAGENET_STD_INV = np.float32(1.0) / IMAGENET_STD      # (3,)
-SIGLIP_MEAN_DIV_STD = SIGLIP_MEAN / SIGLIP_STD          # (3,)
-SIGLIP_STD_INV = np.float32(1.0) / SIGLIP_STD            # (3,)
+IMAGENET_STD_INV = np.float32(1.0) / IMAGENET_STD  # (3,)
+SIGLIP_MEAN_DIV_STD = SIGLIP_MEAN / SIGLIP_STD  # (3,)
+SIGLIP_STD_INV = np.float32(1.0) / SIGLIP_STD  # (3,)
 
 
 # ==============================================================================
 # Step 1: 输入归一化 → PIL RGB
 # ==============================================================================
+
 
 def to_rgb_image(image: Any) -> Image.Image:
     """将任意格式输入转化为 PIL RGB Image。
@@ -113,6 +113,7 @@ def to_rgb_image(image: Any) -> Image.Image:
 # Step 2: 图像缩放 (可选, 仅在尺寸不匹配时)
 # ==============================================================================
 
+
 def resize_if_needed(rgb_image: Image.Image, target_size: int) -> Image.Image:
     """仅在尺寸不匹配时执行 BICUBIC resize。
 
@@ -126,6 +127,7 @@ def resize_if_needed(rgb_image: Image.Image, target_size: int) -> Image.Image:
 # ==============================================================================
 # Step 3-5: 数值处理 — NumPy Reference 路径
 # ==============================================================================
+
 
 def preprocess_numpy_reference(rgb_image: Image.Image) -> np.ndarray:
     """NumPy 参考实现: resize + 双路归一化 + 6CHW 输出。
@@ -152,6 +154,7 @@ def preprocess_numpy_reference(rgb_image: Image.Image) -> np.ndarray:
 # ==============================================================================
 # Step 3-5: 数值处理 — NumPy Fused 路径 (一次遍历, 作为 NEON 的前身)
 # ==============================================================================
+
 
 def preprocess_numpy_fused(rgb_image: Image.Image) -> np.ndarray:
     """NumPy fused 实现: 单次遍历完成所有数值处理。
@@ -185,9 +188,7 @@ def preprocess_numpy_fused(rgb_image: Image.Image) -> np.ndarray:
 _HAS_NATIVE = False
 
 try:
-    if hasattr(torch.ops, "_C") and hasattr(
-        getattr(torch.ops, "_C"), "openvla_fused_preprocess"
-    ):
+    if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "openvla_fused_preprocess"):
         _HAS_NATIVE = True
 except Exception:
     pass
@@ -217,6 +218,7 @@ def preprocess_native(rgb_image: Image.Image) -> np.ndarray:
 # ==============================================================================
 # Step 6: 批处理
 # ==============================================================================
+
 
 def batch_process(
     images: Sequence[Any],
@@ -263,6 +265,7 @@ def batch_process(
 # 测试图片生成
 # ==============================================================================
 
+
 def make_test_image(size: tuple[int, int] = (224, 224)) -> Image.Image:
     """生成随机测试图片。"""
     return Image.fromarray(
@@ -290,24 +293,32 @@ def make_test_images(
 # 正确性验证: reference vs fused vs native (逐值对比)
 # ==============================================================================
 
-def validate(output_ref: np.ndarray, output_test: np.ndarray,
-             name: str, atol: float = 1e-5) -> bool:
+
+def validate(
+    output_ref: np.ndarray, output_test: np.ndarray, name: str, atol: float = 1e-5
+) -> bool:
     """逐值对比两个输出。"""
     if output_ref.shape != output_test.shape:
-        print(f"  [FAIL] {name}: shape 不匹配 "
-              f"ref={output_ref.shape} vs test={output_test.shape}")
+        print(
+            f"  [FAIL] {name}: shape 不匹配 "
+            f"ref={output_ref.shape} vs test={output_test.shape}"
+        )
         return False
     if output_ref.dtype != output_test.dtype:
-        print(f"  [FAIL] {name}: dtype 不匹配 "
-              f"ref={output_ref.dtype} vs test={output_test.dtype}")
+        print(
+            f"  [FAIL] {name}: dtype 不匹配 "
+            f"ref={output_ref.dtype} vs test={output_test.dtype}"
+        )
         return False
 
     max_err = np.abs(output_ref - output_test).max()
     if max_err > atol:
         print(f"  [FAIL] {name}: max_err={max_err:.2e} > atol={atol:.2e}")
         return False
-    print(f"  [OK] {name}: shape={output_ref.shape}, dtype={output_ref.dtype}, "
-          f"max_err={max_err:.2e}")
+    print(
+        f"  [OK] {name}: shape={output_ref.shape}, dtype={output_ref.dtype}, "
+        f"max_err={max_err:.2e}"
+    )
     return True
 
 
@@ -371,6 +382,7 @@ def run_validation() -> bool:
 # 性能分析
 # ==============================================================================
 
+
 class Timer:
     """简单的墙钟计时器。"""
 
@@ -378,7 +390,7 @@ class Timer:
         self.name = name
         self.elapsed = 0.0
 
-    def __enter__(self) -> "Timer":
+    def __enter__(self) -> Timer:
         self.start = time.perf_counter()
         return self
 
@@ -474,8 +486,10 @@ def run_benchmarks(
         print(f"\n{'─' * 70}")
         print(f"图片尺寸: {h}x{w}  |  样本数: {num_images}")
         print(f"{'─' * 70}")
-        print(f"{'方法':<12} {'RGB转换':>8}  {'Resize':>8}  "
-              f"{'数值处理':>8}  {'Batch':>8}  {'总计':>8}  {'吞吐量':>10}")
+        print(
+            f"{'方法':<12} {'RGB转换':>8}  {'Resize':>8}  "
+            f"{'数值处理':>8}  {'Batch':>8}  {'总计':>8}  {'吞吐量':>10}"
+        )
         print(f"{'':─<12} {'':─>8}  {'':─>8}  {'':─>8}  {'':─>8}  {'':─>8}  {'':─>10}")
 
         for method in methods:
@@ -527,6 +541,7 @@ def run_benchmarks(
 # ==============================================================================
 # 逐步骤性能分析 (profile)
 # ==============================================================================
+
 
 def run_profile() -> None:
     """单张图片逐步骤微基准。"""
@@ -616,7 +631,7 @@ def run_profile() -> None:
     print(f"  torch.from_numpy:    {t7.elapsed / 1000 * 1000:.4f} ms")
 
     # 总览对比
-    print(f"\n  ── 总览 (参考路径 vs fused) ──")
+    print("\n  ── 总览 (参考路径 vs fused) ──")
     for _ in range(10):
         preprocess_numpy_reference(resized)
     t_ref = Timer("ref_total")
@@ -642,6 +657,7 @@ def run_profile() -> None:
 # Main CLI
 # ==============================================================================
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="OpenVLA 图片前处理独立流水线 — 优化验证工具",
@@ -654,17 +670,22 @@ def main() -> None:
   python openvla_preprocess_pipeline.py --bench --images 500  # 大规模基准
         """,
     )
-    parser.add_argument("--validate", action="store_true",
-                        help="运行正确性验证 (reference vs fused)")
-    parser.add_argument("--profile", action="store_true",
-                        help="单张图片逐步骤性能分析")
-    parser.add_argument("--bench", action="store_true",
-                        help="完整基准测试 (多种尺寸对比)")
-    parser.add_argument("--images", type=int, default=100,
-                        help="基准测试的图片数量 (默认: 100)")
-    parser.add_argument("--method", choices=["reference", "fused", "native"],
-                        default="reference",
-                        help="处理方法 (默认: reference)")
+    parser.add_argument(
+        "--validate", action="store_true", help="运行正确性验证 (reference vs fused)"
+    )
+    parser.add_argument("--profile", action="store_true", help="单张图片逐步骤性能分析")
+    parser.add_argument(
+        "--bench", action="store_true", help="完整基准测试 (多种尺寸对比)"
+    )
+    parser.add_argument(
+        "--images", type=int, default=100, help="基准测试的图片数量 (默认: 100)"
+    )
+    parser.add_argument(
+        "--method",
+        choices=["reference", "fused", "native"],
+        default="reference",
+        help="处理方法 (默认: reference)",
+    )
 
     args = parser.parse_args()
 

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """vLLM torch op 集成验证 — 编译 + 正确性 + 性能"""
-import torch, numpy as np, time, sys
-from torch.utils.cpp_extension import load_inline
+
+import pathlib
+import sys
+import time
+
+import numpy as np
+import torch
 from PIL import Image
+from torch.utils.cpp_extension import load_inline
 
 IMAGENET_MEAN = np.array([0.484375, 0.455078125, 0.40625], dtype=np.float32)
-IMAGENET_STD  = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
+IMAGENET_STD = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
 SIGLIP_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-SIGLIP_STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+SIGLIP_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
 # Step 1: 编译 — 自动查找 kernel 源文件
 print("=== Step 1: torch.utils.cpp_extension.load_inline 编译 ===")
-import os, pathlib
 
 # 按优先级查找: 命令行参数 > 相对路径 > 绝对路径
 script_dir = pathlib.Path(__file__).resolve().parent
@@ -34,11 +39,17 @@ print(f"  源文件: {cpp_path}")
 cpp_source = open(cpp_path).read()
 
 mod = load_inline(
-    name='openvla_preprocess',
+    name="openvla_preprocess",
     cpp_sources=[cpp_source],
-    functions=['openvla_fused_preprocess'],
-    extra_cflags=['-std=c++17', '-march=armv8.2-a+fp16+dotprod', '-fopenmp', '-O3', '-D__aarch64__'],
-    extra_ldflags=['-fopenmp'],
+    functions=["openvla_fused_preprocess"],
+    extra_cflags=[
+        "-std=c++17",
+        "-march=armv8.2-a+fp16+dotprod",
+        "-fopenmp",
+        "-O3",
+        "-D__aarch64__",
+    ],
+    extra_ldflags=["-fopenmp"],
 )
 print("[OK] 编译成功")
 print(f"   函数签名: {mod.openvla_fused_preprocess}")
@@ -85,5 +96,7 @@ for w, h in [(224, 224), (481, 321), (640, 480), (1920, 1080)]:
     print(f"  {w}x{h}: {ms:.3f} ms")
 
 print()
-print(f"[{'OK' if all_ok else 'FAIL'}] vLLM torch op 集成验证{'全部通过' if all_ok else '存在差异'}")
+print(
+    f"[{'OK' if all_ok else 'FAIL'}] vLLM torch op 集成验证{'全部通过' if all_ok else '存在差异'}"
+)
 sys.exit(0 if all_ok else 1)

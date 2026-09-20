@@ -1,0 +1,67 @@
+# pre-commit 配置 — 首次使用前请执行:
+#   pip install pre-commit
+#   pre-commit install
+# 配置参考 openlibing community 接入指南:
+#   https://gitcode.com/openlibing/community/blob/opensource-codecheck/docs/开源代码检查/pre-commit接入指南.md
+#
+# 钩子会拦截: trailing whitespace、缺尾行、YAML/JSON/XML 语法、合并冲突标记、
+# 私钥泄露、C++ Google Style 风格(cpplint)、Python 格式/静态检查(ruff)。
+repos:
+  # ===================== 通用基础钩子(所有语言) =====================
+  - repo: https://gitcode.com/gh_mirrors/pr/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-xml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb", "500"]
+      - id: detect-private-key
+
+  # ===================== 敏感信息扫描 =====================
+  - repo: https://gitcode.com/gh_mirrors/de/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+
+  # ===================== C++ (cpplint, Google C++ Style) =====================
+  - repo: https://gitcode.com/gh_mirrors/cpp/cpplint
+    rev: 2.0.0
+    hooks:
+      - id: cpplint
+        # 关闭过严/与本仓不符的检查:
+        #   whitespace/line_length — 已有 + /* 占位注释对触发长行
+        #   whitespace/parens      — 已统一 4 空格缩进, 不强制 K&R 风格大括号
+        #   legal/copyright        — 许可证文本由仓库根 LICENSE 提供, 不在源文件重复
+        #   build/include_subdir   — 头文件无子目录层级
+        args:
+          # 关闭过严/与本仓不符的检查:
+          #   whitespace/line_length     — 已有 + /* 占位注释对触发长行
+          #   whitespace/parens          — 已统一 4 空格缩进, 不强制 K&R 风格大括号
+          #   whitespace/braces          — 项目自身选择开括号独占一行(Allman),
+          #                                 与 Google C++ Style (K&R) 不一致, 保留
+          #   whitespace/comments        — 单空格注释是项目惯例
+          #   legal/copyright            — 许可证文本由仓库根 LICENSE 提供, 不在源文件重复
+          #   build/include_subdir       — 头文件无子目录层级
+          #   build/include_what_you_use — torch/ctypes 头由 CMake 控制, 非手写
+          #   runtime/references         — free_lut(Lut& lut) 显式置 null 标记已释放,
+          #                                 这是项目惯用的引用置空模式
+          - --filter=-whitespace/line_length,-whitespace/parens,-whitespace/braces,-whitespace/comments,-legal/copyright,-build/include_subdir,-build/include_what_you_use,-runtime/references
+        files: \.(cpp|h|hpp|cc|hh|cxx)$
+
+  # ===================== Python (ruff) =====================
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
+    rev: v0.15.8
+    hooks:
+      - id: ruff-format
+      - id: ruff-check
+        # 关闭项目特定豁免:
+        #   EXE001 — test_*.py 是库脚本, shebang 不需要可执行位
+        #   S110   — try/except/pass 模式 (Python fallback 路径, 已注释说明)
+        #   BLE001 — except Exception 是项目兼容多个后端 (torch/vllm/无) 的设计
+        #   PYI034 — `class Timer` 暂未迁移 typing.Self, 不影响运行
+        #   SIM115 — 一次性 open().read() 测试脚本场景, 无需 with
+        args: ["--fix", "--ignore=EXE001,S110,BLE001,PYI034,SIM115"]

@@ -235,6 +235,17 @@ static inline uint8_t clamp_to_u8(float v) {
         std::max(0.0f, std::min(kUint8ToFloatDivisor, std::round(v))));
 }
 
+// resize pass 公共参数 — 把 5 个相关标量打包, 减少单函数参数数量.
+// 必须放在 #if defined(__aarch64__) 块之前, 因为 NEON 与 scalar 两路径都引用
+// (Fix for issue #6: 原实现把本 struct 放在 scalar fallback 区尾部, 导致
+//  aarch64 编译时 NEON 函数引用未声明类型, 编译失败).
+struct ResizePassParams {
+    int H;             // 行数: 水平 pass 是 H_in, 垂直 pass 是 H_out
+    int W_out;         // 输出宽度
+    int num_threads;   // OMP 线程数
+    const Lut* lut;    // x 方向 (水平) 或 y 方向 (垂直) LUT
+};
+
 #if defined(__aarch64__) && !defined(__APPLE__)
 
 // RGB 加权求和结果 — 打包减少 accumulate_pixel_* 输出参数数量
@@ -320,7 +331,50 @@ static void neon_resize_horizontal(
     }
 }
 
+// 单像素垂直 resize 累加 — 抽出为独立函数以满足 G.FUN.01-CPP 嵌套层次规则.
+// 返回 (R, G, B) 加权和, 内部按 n 选择 NEON 4-tap 快路径或通用 fallback:
+//   n == 4: NEON 4-tap 展开
+//   n != 4: 通用 n 像素累加 (Fix for issue #7 — 显式 (ymin+k)*stride + x*kInputChannels 寻址,
+//           不可复用水平 pass 的 accumulate_pixel_n, 该函数第 3 形参是水平像素起点 xmin)
+static inline RgbSum accumulate_vertical_pixel(
+    const float* mid, int x, int n, int ymin,
+    const float* w_row, int stride)
+{
+    RgbSum rgb;
+    if (n == kBicubicFastPathN) {
+        const float* s0 = mid + (ymin + 0) * stride + x * kInputChannels;
+        const float* s1 = mid + (ymin + 1) * stride + x * kInputChannels;
+        const float* s2 = mid + (ymin + 2) * stride + x * kInputChannels;
+        const float* s3 = mid + (ymin + 3) * stride + x * kInputChannels;
+        float rv[kFloatsPerLane] = {s0[kChannelR], s1[kChannelR], s2[kChannelR], s3[kChannelR]};
+        float gv[kFloatsPerLane] = {s0[kChannelG], s1[kChannelG], s2[kChannelG], s3[kChannelG]};
+        float bv[kFloatsPerLane] = {s0[kChannelB], s1[kChannelB], s2[kChannelB], s3[kChannelB]};
+        float32x4_t rv4 = vld1q_f32(rv);
+        float32x4_t gv4 = vld1q_f32(gv);
+        float32x4_t bv4 = vld1q_f32(bv);
+        float32x4_t wv4 = vld1q_f32(w_row);
+        rgb.r = vaddvq_f32(vmulq_f32(rv4, wv4));
+        rgb.g = vaddvq_f32(vmulq_f32(gv4, wv4));
+        rgb.b = vaddvq_f32(vmulq_f32(bv4, wv4));
+    } else {
+        float R = 0.0f, G = 0.0f, B = 0.0f;
+        for (int k = 0; k < n; ++k) {
+            const float* src_row = mid + (ymin + k) * stride + x * kInputChannels;
+            const float wk = w_row[k];
+            R += src_row[kChannelR] * wk;
+            G += src_row[kChannelG] * wk;
+            B += src_row[kChannelB] * wk;
+        }
+        rgb.r = R;
+        rgb.g = G;
+        rgb.b = B;
+    }
+    return rgb;
+}
+
 // resize 垂直 pass — 中间缓冲 → 输出 uint8
+// 嵌套层次: function (1) → for y (2) → for x (3) — 满足 G.FUN.01-CPP (≤ 4 层).
+// 单像素累加逻辑已抽到 accumulate_vertical_pixel helper.
 static void neon_resize_vertical(
     const float* mid, uint8_t* output,
     const ResizePassParams& p)
@@ -333,25 +387,7 @@ static void neon_resize_vertical(
         int ymin = p.lut->start[y];
         const float* w_row = p.lut->w + y * p.lut->ksize;
         for (int x = 0; x < p.W_out; ++x) {
-            RgbSum rgb;
-            if (n == kBicubicFastPathN) {
-                const float* s0 = mid + (ymin + 0) * stride + x * kInputChannels;
-                const float* s1 = mid + (ymin + 1) * stride + x * kInputChannels;
-                const float* s2 = mid + (ymin + 2) * stride + x * kInputChannels;
-                const float* s3 = mid + (ymin + 3) * stride + x * kInputChannels;
-                float rv[kFloatsPerLane] = {s0[kChannelR], s1[kChannelR], s2[kChannelR], s3[kChannelR]};
-                float gv[kFloatsPerLane] = {s0[kChannelG], s1[kChannelG], s2[kChannelG], s3[kChannelG]};
-                float bv[kFloatsPerLane] = {s0[kChannelB], s1[kChannelB], s2[kChannelB], s3[kChannelB]};
-                float32x4_t rv4 = vld1q_f32(rv);
-                float32x4_t gv4 = vld1q_f32(gv);
-                float32x4_t bv4 = vld1q_f32(bv);
-                float32x4_t wv4 = vld1q_f32(w_row);
-                rgb.r = vaddvq_f32(vmulq_f32(rv4, wv4));
-                rgb.g = vaddvq_f32(vmulq_f32(gv4, wv4));
-                rgb.b = vaddvq_f32(vmulq_f32(bv4, wv4));
-            } else {
-                rgb = accumulate_pixel_n(w_row, mid + x * kInputChannels, ymin, n);
-            }
+            RgbSum rgb = accumulate_vertical_pixel(mid, x, n, ymin, w_row, stride);
             int off = x * kInputChannels;
             dst[off + kChannelR] = clamp_to_u8(rgb.r);
             dst[off + kChannelG] = clamp_to_u8(rgb.g);
@@ -383,14 +419,8 @@ static void neon_resize(
 // ============================================================================
 // 标量 resize fallback (非 ARM 平台)
 // ============================================================================
-
-// resize pass 公共参数 — 把 5 个相关标量打包, 减少单函数参数数量
-struct ResizePassParams {
-    int H;             // 行数: 水平 pass 是 H_in, 垂直 pass 是 H_out
-    int W_out;         // 输出宽度
-    int num_threads;   // OMP 线程数
-    const Lut* lut;    // x 方向 (水平) 或 y 方向 (垂直) LUT
-};
+// 注: ResizePassParams 已上移到 NEON 块之前 (issue #6 fix),
+// 这里只放 scalar 版本的实现.
 
 static void scalar_resize_horizontal(
     const uint8_t* input, float* mid, int W_in,
@@ -629,11 +659,16 @@ static void neon_normalize(
 {
     constexpr int blocks_per_row = kOutputSize / kBlockPixels;
 
-    // 6 路输出 — DINOv2 (d) + SigLIP (s)
+    // 6 路输出 — DINOv2 (d) + SigLIP (s), 每路占 kOutputPlane floats.
+    // 第 k 路基址 = output + k * kOutputPlane.
+    // Fix for issue #9: 原 d[B] 写成 "output + kInputChannels * kOutputPlane"
+    // 即 "output + 3 * kOutputPlane", 与 s[R] (4 * 输出通道起始点) 共享同一段内存,
+    // 导致 d[B] 通道被 s[R] 覆盖. 正确索引应是 "output + kChannelB * kOutputPlane"
+    // (即 2 * kOutputPlane), 与后续 s[R]=(3)*kOutputPlane 保持 1 个 plane 的偏移.
     OutputPlanes planes;
-    planes.d[kChannelR] = output;
-    planes.d[kChannelG] = output + kOutputPlane;
-    planes.d[kChannelB] = output + kInputChannels * kOutputPlane;  // 2 * kOutputPlane
+    planes.d[kChannelR] = output + kChannelR * kOutputPlane;          // 0 * plane
+    planes.d[kChannelG] = output + kChannelG * kOutputPlane;          // 1 * plane
+    planes.d[kChannelB] = output + kChannelB * kOutputPlane;          // 2 * plane
     planes.s[kChannelR] = output + (kInputChannels + kChannelR) * kOutputPlane;  // 3 *
     planes.s[kChannelG] = output + (kInputChannels + kChannelG) * kOutputPlane;  // 4 *
     planes.s[kChannelB] = output + (kInputChannels + kChannelB) * kOutputPlane;  // 5 *
@@ -671,6 +706,10 @@ static void neon_normalize(
 // 合并算子入口: resize (如需) + normalize → [6, 224, 224]
 // ============================================================================
 
+// 前向声明 — openvla_fused_preprocess 内部调用零拷贝入口
+void openvla_fused_preprocess_into(
+    const torch::Tensor& input, float* output_data, int64_t num_threads);
+
 static void run_resize(const uint8_t* in_ptr, uint8_t* out_ptr,
                        int H, int W, int num_threads) {
 #if defined(__aarch64__) && !defined(__APPLE__)
@@ -701,16 +740,37 @@ torch::Tensor openvla_fused_preprocess(
                 "input must be [H, W, ", kInputChannels, "], got [",
                 input.size(kDimH), ", ", input.size(kDimW), ", ", input.size(kDimC), "]");
 
-    const int H = static_cast<int>(input.size(kDimH));
-    const int W = static_cast<int>(input.size(kDimW));
-    const bool need_resize = (H != kOutputSize || W != kOutputSize);
-
     // 分配输出 [6, 224, 224] float32 (Python torch.stack 加 batch 维)
     auto output = torch::empty({kOutputChannels, kOutputSize, kOutputSize},
                                 torch::TensorOptions()
                                     .dtype(torch::kFloat32)
                                     .device(torch::kCPU)
                                     .memory_format(torch::MemoryFormat::Contiguous));
+
+    openvla_fused_preprocess_into(input, output.data_ptr<float>(), num_threads);
+    return output;
+}
+
+// Zero-copy 入口 — 复用调用方预分配的 float 缓冲区 (避免一次 6×224×224
+// = ~1.2 MB 的额外分配 + memcpy, 与设计文档 "零拷贝返回" 一致).
+// 调用方需保证 output_data 指向至少 6*224*224 = 301056 个 float 的合法内存.
+void openvla_fused_preprocess_into(
+    const torch::Tensor& input, float* output_data, int64_t num_threads)
+{
+    init_constants();
+
+    TORCH_CHECK(input.device().is_cpu(), "input must be on CPU");
+    TORCH_CHECK(input.dtype() == torch::kUInt8, "input must be uint8");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == kInputDims && input.size(kDimC) == kInputChannels,
+                "input must be [H, W, ", kInputChannels, "], got [",
+                input.size(kDimH), ", ", input.size(kDimW), ", ", input.size(kDimC), "]");
+    TORCH_CHECK(output_data != nullptr,
+                "openvla_fused_preprocess_into: output_data must be non-null");
+
+    const int H = static_cast<int>(input.size(kDimH));
+    const int W = static_cast<int>(input.size(kDimW));
+    const bool need_resize = (H != kOutputSize || W != kOutputSize);
 
     const int n_threads = static_cast<int>(num_threads);
 
@@ -723,13 +783,11 @@ torch::Tensor openvla_fused_preprocess(
         run_resize(input.data_ptr<uint8_t>(),
                    resize_buf.data_ptr<uint8_t>(), H, W, n_threads);
         run_normalize(resize_buf.data_ptr<uint8_t>(),
-                      output.data_ptr<float>(), kOutputSize, kOutputSize, n_threads);
+                      output_data, kOutputSize, kOutputSize, n_threads);
     } else {
         run_normalize(input.data_ptr<uint8_t>(),
-                      output.data_ptr<float>(), H, W, n_threads);
+                      output_data, H, W, n_threads);
     }
-
-    return output;
 }
 
 // ============================================================================
@@ -753,13 +811,12 @@ void openvla_fused_preprocess_c(
         torch::kUInt8
     ).contiguous();  // 确保内存连续
 
-    auto output = openvla_fused_preprocess(input, num_threads);
-
-    // 拷贝结果到预分配缓冲
-    // output 形状: [6, 224, 224] float32
-    constexpr size_t kOutputFloats = static_cast<size_t>(kOutputChannels)
-                                   * static_cast<size_t>(kOutputPlane);
-    std::memcpy(output_data, output.data_ptr<float>(), kOutputFloats * sizeof(float));
+    // Fix for issue #8: 原实现调用 openvla_fused_preprocess(input) 触发
+    // 一次 torch::empty 分配 [6,224,224] (≈1.2 MB) + 一次 std::memcpy
+    // 回 output_data, 与设计文档 "零拷贝返回" 不符. 改用零拷贝入口
+    // openvla_fused_preprocess_into, 直接写入 Python 侧预分配的 output_data,
+    // 去掉一次分配 + 一次整块拷贝.
+    openvla_fused_preprocess_into(input, output_data, num_threads);
 }
 
 }  // extern "C"
