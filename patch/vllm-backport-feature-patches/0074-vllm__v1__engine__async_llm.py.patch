@@ -1,0 +1,13 @@
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 6be0a07baeb2080f27f004bfb81fc52b542b6462..b5494cc82daa687e375d19874cdf81188e59d6bd 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -890,7 +890,7 @@ class AsyncLLM(EngineClient):
+         await asyncio.gather(*coros)
+ 
+     async def reset_mm_cache(self) -> None:
+-        self.renderer.clear_mm_cache()
++        await self.renderer.clear_mm_cache_async()
+         await self.engine_core.reset_mm_cache_async()
+ 
+     async def reset_prefix_cache(

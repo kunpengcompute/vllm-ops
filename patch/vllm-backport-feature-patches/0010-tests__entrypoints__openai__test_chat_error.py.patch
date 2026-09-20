@@ -1,0 +1,12 @@
+diff --git a/tests/entrypoints/openai/test_chat_error.py b/tests/entrypoints/openai/test_chat_error.py
+index 970945b4759fb7ed2660d6083e5dab05071ca67c..835a25c4119e1e7536a70ba230ed3da384ca3900 100644
+--- a/tests/entrypoints/openai/test_chat_error.py
++++ b/tests/entrypoints/openai/test_chat_error.py
+@@ -55,6 +55,7 @@ class MockModelConfig:
+     skip_tokenizer_init = False
+     is_encoder_decoder: bool = False
+     is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
+ 
+     def get_diff_sampling_param(self):
+         return self.diff_sampling_param or {}

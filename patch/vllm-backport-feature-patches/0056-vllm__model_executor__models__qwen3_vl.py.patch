@@ -1,0 +1,12 @@
+diff --git a/vllm/model_executor/models/qwen3_vl.py b/vllm/model_executor/models/qwen3_vl.py
+index b19811977bbc99f971ba4ce160020d56d6708afb..c72fe08a8ab7a54fe7c767a993915d9f6abf5088 100644
+--- a/vllm/model_executor/models/qwen3_vl.py
++++ b/vllm/model_executor/models/qwen3_vl.py
+@@ -560,7 +560,6 @@ class Qwen3_VisionTransformer(nn.Module):
+         max_seqlen = torch.tensor(
+             MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
+             dtype=torch.int32,
+-            device=self.device,
+         )
+         cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+             self.attn_backend,

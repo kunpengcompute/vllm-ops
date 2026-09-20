@@ -1,0 +1,27 @@
+diff --git a/vllm/utils/mistral.py b/vllm/utils/mistral.py
+index c9c24a2e306c167f475ccba572bef5a9ddd3485f..7b4ddf78397d2812ff380ea6dc2616dcff8b4865 100644
+--- a/vllm/utils/mistral.py
++++ b/vllm/utils/mistral.py
+@@ -12,8 +12,10 @@ from vllm.utils.import_utils import LazyLoader
+ if TYPE_CHECKING:
+     # if type checking, eagerly import the module
+     import vllm.tokenizers.mistral as mt
++    import vllm.tool_parsers.mistral_tool_parser as mtp
+ else:
+     mt = LazyLoader("mt", globals(), "vllm.tokenizers.mistral")
++    mtp = LazyLoader("mtp", globals(), "vllm.tool_parsers.mistral_tool_parser")
+ 
+ 
+ def is_mistral_tokenizer(obj: TokenizerLike | None) -> TypeGuard[mt.MistralTokenizer]:
+@@ -26,3 +28,11 @@ def is_mistral_tokenizer(obj: TokenizerLike | None) -> TypeGuard[mt.MistralToken
+         getattr(cls, "IS_MISTRAL_TOKENIZER", False)
+         and isinstance(obj, mt.MistralTokenizer)
+     )
++
++
++def is_mistral_tool_parser(cls: type | None) -> bool:
++    """Return true if *cls* is a MistralToolParser subclass."""
++    return bool(
++        getattr(cls, "IS_MISTRAL_TOOL_PARSER", False)
++        and issubclass(cls, mtp.MistralToolParser)  # type: ignore[arg-type]
++    )

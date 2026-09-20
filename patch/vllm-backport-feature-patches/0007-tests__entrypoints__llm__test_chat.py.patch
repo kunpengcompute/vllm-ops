@@ -1,0 +1,13 @@
+diff --git a/tests/entrypoints/llm/test_chat.py b/tests/entrypoints/llm/test_chat.py
+index ba3b80320e78dd22e1187ac6d5dedcbbdb1390f4..20ed73e260cd9392b5f18dbca25bf51fdfc6a19c 100644
+--- a/tests/entrypoints/llm/test_chat.py
++++ b/tests/entrypoints/llm/test_chat.py
+@@ -200,7 +200,7 @@ def test_chat_batch_failure_cleanup(llm_for_failure_test):
+     batch_2 = [valid_msg, valid_msg]
+     sampling_params = SamplingParams(temperature=0, max_tokens=10)
+ 
+-    with pytest.raises(ValueError, match="context length is only"):
++    with pytest.raises(ValueError, match="maximum context length is"):
+         llm.chat(batch_1, sampling_params=sampling_params)
+     assert llm.llm_engine.get_num_unfinished_requests() == 0
+ 

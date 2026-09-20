@@ -1,0 +1,20 @@
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index c609bc1b85ecb047ef50b03ebc67dbfd55802bb6..249a7e72187bf9793be4cd947ef089befffcde02 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -202,6 +202,15 @@ def test_kv_cache_block():
+     assert block.block_hash is None
+ 
+ 
++def test_kv_cache_block_uses_slots():
++    block = KVCacheBlock(block_id=0)
++
++    assert not hasattr(block, "__dict__")
++
++    with pytest.raises(AttributeError):
++        block.unexpected_field = True
++
++
+ def test_free_kv_cache_block_queue_initialization():
+     # Test with a single block
+     block = KVCacheBlock(block_id=0)

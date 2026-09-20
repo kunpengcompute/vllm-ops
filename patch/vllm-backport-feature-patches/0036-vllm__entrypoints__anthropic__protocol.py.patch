@@ -1,0 +1,29 @@
+diff --git a/vllm/entrypoints/anthropic/protocol.py b/vllm/entrypoints/anthropic/protocol.py
+index c541db5139d3b06f0d4d1dd6d9a62381e097a3a4..ab3ca66e2cd00c6cda35dcc1b0035ba206c4ac0e 100644
+--- a/vllm/entrypoints/anthropic/protocol.py
++++ b/vllm/entrypoints/anthropic/protocol.py
+@@ -34,7 +34,14 @@ class AnthropicUsage(BaseModel):
+ class AnthropicContentBlock(BaseModel):
+     """Content block in message"""
+ 
+-    type: Literal["text", "image", "tool_use", "tool_result", "thinking"]
++    type: Literal[
++        "text",
++        "image",
++        "tool_use",
++        "tool_result",
++        "thinking",
++        "redacted_thinking",
++    ]
+     text: str | None = None
+     # For image content
+     source: dict[str, Any] | None = None
+@@ -48,6 +55,8 @@ class AnthropicContentBlock(BaseModel):
+     # For thinking content
+     thinking: str | None = None
+     signature: str | None = None
++    # For redacted thinking content (safety-filtered by the API)
++    data: str | None = None
+ 
+ 
+ class AnthropicMessage(BaseModel):

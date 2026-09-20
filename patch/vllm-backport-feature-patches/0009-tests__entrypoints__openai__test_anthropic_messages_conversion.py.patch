@@ -1,0 +1,90 @@
+diff --git a/tests/entrypoints/openai/test_anthropic_messages_conversion.py b/tests/entrypoints/openai/test_anthropic_messages_conversion.py
+index 3647c187f5198b7d0c7fccd46d7807274fbdeb3a..e3225807e2462e83f34052f612138634e963f045 100644
+--- a/tests/entrypoints/openai/test_anthropic_messages_conversion.py
++++ b/tests/entrypoints/openai/test_anthropic_messages_conversion.py
+@@ -324,3 +324,85 @@ class TestToolResultContent:
+             if m["role"] == "user" and isinstance(m.get("content"), list)
+         ]
+         assert len(user_follow_ups) == 0
++
++
++# ======================================================================
++# Attribution header stripping
++# ======================================================================
++
++
++class TestAttributionHeaderStripping:
++    def test_billing_header_stripped_from_system(self):
++        """Claude Code's x-anthropic-billing-header block should be
++        stripped to preserve prefix caching."""
++        request = _make_request(
++            [{"role": "user", "content": "Hello"}],
++            system=[
++                {"type": "text", "text": "You are a helpful assistant."},
++                {
++                    "type": "text",
++                    "text": "x-anthropic-billing-header: "
++                    "cc_version=2.1.37.abc; cc_entrypoint=cli;",
++                },
++            ],
++        )
++        result = _convert(request)
++        system_msg = result.messages[0]
++        assert system_msg["role"] == "system"
++        assert system_msg["content"] == "You are a helpful assistant."
++
++    def test_system_without_billing_header_unchanged(self):
++        """Normal system blocks should pass through unchanged."""
++        request = _make_request(
++            [{"role": "user", "content": "Hello"}],
++            system=[
++                {"type": "text", "text": "You are a helpful assistant."},
++                {"type": "text", "text": " Be concise."},
++            ],
++        )
++        result = _convert(request)
++        system_msg = result.messages[0]
++        assert system_msg["content"] == "You are a helpful assistant. Be concise."
++
++    def test_system_string_unchanged(self):
++        """String system prompts should pass through unchanged."""
++        request = _make_request(
++            [{"role": "user", "content": "Hello"}],
++            system="You are a helpful assistant.",
++        )
++        result = _convert(request)
++        system_msg = result.messages[0]
++        assert system_msg["content"] == "You are a helpful assistant."
++
++
++class TestRedactedThinkingBlock:
++    def test_redacted_thinking_block_is_accepted(self):
++        request = _make_request(
++            [
++                {"role": "user", "content": "Hello"},
++                {
++                    "role": "assistant",
++                    "content": [
++                        {
++                            "type": "thinking",
++                            "thinking": "Thinking...",
++                            "signature": "sig_think",
++                        },
++                        {
++                            "type": "redacted_thinking",
++                            "data": "BASE64_OR_OTHER_OPAQUE_DATA",
++                        },
++                        {"type": "text", "text": "Hi!"},
++                    ],
++                },
++                {"role": "user", "content": "Continue"},
++            ]
++        )
++        result = _convert(request)
++
++        asst_msgs = [m for m in result.messages if m.get("role") == "assistant"]
++        assert len(asst_msgs) == 1
++        asst = asst_msgs[0]
++
++        assert asst.get("reasoning") == "Thinking..."
++        assert asst.get("content") == "Hi!"

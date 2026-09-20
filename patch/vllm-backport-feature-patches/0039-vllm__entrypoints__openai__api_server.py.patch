@@ -1,0 +1,27 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index d76a7446d2a9f5d4d9c309dfbb65dba5c784e496..7f330cc9ca1abc02e9b1ae8277a4f1318237b3bc 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -30,12 +30,14 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
+ from vllm.entrypoints.openai.models.protocol import BaseModelPath
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+ from vllm.entrypoints.openai.server_utils import (
++    generation_error_handler,
+     get_uvicorn_log_config,
+     http_exception_handler,
+     lifespan,
+     log_response,
+     validation_exception_handler,
+ )
++from vllm.entrypoints.openai.engine.serving import GenerationError
+ from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
+ from vllm.entrypoints.serve.elastic_ep.middleware import (
+     ScalingMiddleware,
+@@ -249,6 +251,7 @@ def build_app(
+ 
+     app.exception_handler(HTTPException)(http_exception_handler)
+     app.exception_handler(RequestValidationError)(validation_exception_handler)
++    app.exception_handler(GenerationError)(generation_error_handler)
+ 
+     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
+     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:

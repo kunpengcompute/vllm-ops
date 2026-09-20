@@ -1,0 +1,74 @@
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 7e1f1cf418bf854c4c09da00bc470c900c3f2cde..f16c0607532ee0b20b669acd35a06d4519f273d7 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -35,6 +35,7 @@ from vllm.v1.engine import (
+     EEP_NOTIFICATION_CALL_ID,
+     EEPNotificationType,
+     EngineCoreOutputs,
++    EngineCoreReadyResponse,
+     EngineCoreRequest,
+     EngineCoreRequestType,
+     PauseMode,
+@@ -454,6 +455,20 @@ class ElasticScalingCache:
+     pending_notifications: dict[EEPNotificationType, set[int]]
+ 
+ 
++_ready_response_decoder = msgspec.msgpack.Decoder(EngineCoreReadyResponse)
++
++
++def _apply_ready_response(payload: bytes, vllm_config: VllmConfig) -> None:
++    if not payload:
++        return
++    response = _ready_response_decoder.decode(payload)
++    if response.max_model_len is not None:
++        vllm_config.model_config.max_model_len = min(
++            vllm_config.model_config.max_model_len,
++            response.max_model_len,
++        )
++
++
+ def allocate_stateless_group_ports(parallel_config, new_data_parallel_size: int):
+     """
+     Allocate stateless group ports for elastic EP.
+@@ -617,8 +632,9 @@ class MPClient(EngineCoreClient):
+                         f"timeout, set the environment variable: "
+                         f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
+                     )
+-                identity, _ = sync_input_socket.recv_multipart()
++                identity, payload = sync_input_socket.recv_multipart()
+                 identities.remove(identity)
++                _apply_ready_response(payload, vllm_config)
+ 
+             self.core_engine: EngineIdentity = self.core_engines[0]
+             self.utility_results: dict[int, AnyFuture] = {}
+@@ -638,7 +654,8 @@ class MPClient(EngineCoreClient):
+ 
+     def shutdown(self):
+         # Terminate background resources.
+-        self._finalizer()
++        if self._finalizer.detach() is not None:
++            self.resources()
+ 
+     def _format_exception(self, e: Exception) -> Exception:
+         """If errored, use EngineDeadError so root cause is clear."""
+@@ -682,7 +699,7 @@ class MPClient(EngineCoreClient):
+             sentinels = [proc.sentinel for proc in engine_processes]
+             died = multiprocessing.connection.wait(sentinels)
+             _self = self_ref()
+-            if not _self or _self.resources.engine_dead:
++            if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
+                 return
+             _self.resources.engine_dead = True
+             proc_name = next(
+@@ -1598,8 +1615,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
+                     f"timeout, set the environment variable: "
+                     f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
+                 )
+-            identity, _ = sync_input_socket.recv_multipart()
++            identity, payload = sync_input_socket.recv_multipart()
+             new_engine_identities.discard(identity)
++            _apply_ready_response(payload, self.vllm_config)
+ 
+         # NOTE(yongji): Before we schedule any requests on the new workers,
+         # we should wait for them to switch to the new setup.

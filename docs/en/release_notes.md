@@ -4,41 +4,26 @@
 
 ### Product Version Information
 
-<a name="table62675726"></a>
-<table><tbody><tr id="row41561572"><th class="firstcol" valign="top" width="42.17%" id="mcps1.1.3.1.1"><p id="p11044137"><a name="p11044137"></a><a name="p11044137"></a>Product Name</p>
-</th>
-<td class="cellrowborder" valign="top" width="57.830000000000005%" headers="mcps1.1.3.1.1 "><p id="p1597721693713"><a name="p1597721693713"></a><a name="p1597721693713"></a>Kunpeng BoostKit</p>
-</td>
-</tr>
-<tr id="row41561572"><th class="firstcol" valign="top" width="42.17%" id="mcps1.1.3.1.1"><p id="p11044137"><a name="p11044137"></a><a name="p11044137"></a>Product Version</p>
-</th>
-<td class="cellrowborder" valign="top" width="57.830000000000005%" headers="mcps1.1.3.1.1 "><p id="p1597721693713"><a name="p1597721693713"></a><a name="p1597721693713"></a>26.1.RC1</p>
-</td>
-</tr>
-<tr id="row1930811171892"><th class="firstcol" valign="top" width="42.17%" id="mcps1.1.3.3.1"><p id="p2030912172097"><a name="p2030912172097"></a><a name="p2030912172097"></a>Software Name</p>
-</th>
-<td class="cellrowborder" valign="top" width="57.830000000000005%" headers="mcps1.1.3.3.1 "><p id="p1730912179911"><a name="p1730912179911"></a><a name="p1730912179911"></a>vLLM-ops</p>
-</td>
-</tr>
-<tr id="row5497143514612"><th class="firstcol" valign="top" width="42.17%" id="mcps1.1.3.4.1"><p id="p162251517551"><a name="p162251517551"></a><a name="p162251517551"></a>Software Package Version</p>
-</th>
-<td class="cellrowborder" valign="top" width="57.830000000000005%" headers="mcps1.1.3.4.1 "><p id="p6225131165519"><a name="p6225131165519"></a><a name="p6225131165519"></a>V1.0.0</p>
-</td>
-</tr>
-</tbody>
-</table>
+<table><tbody>
+<tr><th valign="top" width="42.17%"><p>Product Version</p></th>
+<td valign="top" width="57.83%"><p>26.2.RC1</p></td></tr>
+<tr><th valign="top" width="42.17%"><p>Software Name</p></th>
+<td valign="top" width="57.83%"><p>vLLM High-Version Feature Backport</p></td></tr>
+<tr><th valign="top" width="42.17%"><p>Software Package Version</p></th>
+<td valign="top" width="57.83%"><p>v2.1.0</p></td></tr>
+</tbody></table>
 
-### OS, Compiler, and CPU
+### Accelerator Compatibility
 
-|  OS| CPU | vLLM| vLLM-metax|
-| ------------ | ------------ |------------ |------------ |
-| openEuler 24.03 LTS SP1| New Kunpeng 920 processor model|0.11.0 |0.11.0-dev |
+| Accelerator | vLLM | vLLM-MetaX |
+| ------------ | ------------ | ------------ |
+| MetaX C500 GPU | 0.17.0 | 0.17.0 |
 
-## V1.0.0
+## v2.1.0
 
-### Change Description
+### Update Description
 
-vLLM-ops is a performance improvement patch repository for large language model (LLM) inference based on the new Kunpeng 920 processor model and MetaX C500. It uses Python code optimization on the CPU side to reduce data transmission between the CPU and GPU, and OS-side optimization to improve throughput.
+For the inference scenario on the MetaX C500 GPU, based on the vLLM 0.15.0 container provided by MetaX, this release compiles vLLM 0.17.0 and vLLM-MetaX 0.17.0 from source, backports 38 feature points from vLLM 0.18.0, 0.19.0, and 0.20.0 to eliminate the performance disadvantages caused by version lag, and additionally applies opt optimizations (greedy sampler fast path, block table dirty-row local copy) and vLLM-MetaX FlashAttention metadata optimizations (prefill max length D2H sync optimization, Non-DCP cu_seqlens_k precomputation optimization) to further reduce the overhead on the inference hot path.
 
 ### Resolved Issues
 
@@ -48,16 +33,16 @@ None
 
 None
 
-## Related Documentation
+## Version-Matching Documents
 
-### V1.0.0 Documentation
+### v2.1.0 Version-Matching Documents
 
-| Document| Description| Delivery Mode|
-| ------------ | ------------ | ---|
-| Release Notes| Provides basic information and feature updates of each vLLM-ops version.| Open-source repository|
-| User Guide|Provides vLLM-ops optimization usage description.| Open-source repository|
-| Feature Description| Provides vLLM-ops optimization description.| Open-source repository|
+| Document Name | Description | Delivery Method |
+| ------------ | ------------ | --- |
+| Release Notes | Provides basic information and feature updates of each release version. | Open-source repository |
+| User Guide | Provides the usage description of the backport patches. | Open-source repository |
+| Feature Introduction | Provides the description of the high-version feature backport and optimizations. | Open-source repository |
 
-### Obtaining Documentation
+### How to Obtain Documents
 
-Visit the [open-source repository](https://gitcode.com/boostkit/vllm-ops) to view or download related documents.
+You can browse and obtain the related documents by visiting the [open-source repository](https://gitcode.com/boostkit/vllm-ops).

@@ -1,0 +1,13 @@
+diff --git a/vllm/tool_parsers/mistral_tool_parser.py b/vllm/tool_parsers/mistral_tool_parser.py
+index baab4ade0547378c548f65ef3402f8bfba964e2f..7a1ac1337f0a438a779194763eb2958dcacb3806 100644
+--- a/vllm/tool_parsers/mistral_tool_parser.py
++++ b/vllm/tool_parsers/mistral_tool_parser.py
+@@ -78,6 +78,8 @@ class MistralToolParser(ToolParser):
+     Used when --enable-auto-tool-choice --tool-call-parser mistral are all set
+     """
+ 
++    IS_MISTRAL_TOOL_PARSER = True
++
+     def __init__(self, tokenizer: TokenizerLike):
+         super().__init__(tokenizer)
+ 

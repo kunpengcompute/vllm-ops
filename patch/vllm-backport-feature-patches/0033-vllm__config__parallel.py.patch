@@ -1,0 +1,14 @@
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index 6e84cf16b20323d075f5435782319e94ac7950b2..2dff0ea7b8dc9dbd0d4540fc1f8329bbb867310a 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -134,6 +134,9 @@ class ParallelConfig:
+     """Whether the deployed model is MoE (if known)."""
+     enable_expert_parallel: bool = False
+     """Use expert parallelism instead of tensor parallelism for MoE layers."""
++    enable_ep_weight_filter: bool = False
++    """Skip non-local expert weights during model loading when expert
++    parallelism is active. Has no effect unless expert parallelism is enabled."""
+     enable_eplb: bool = False
+     """Enable expert parallelism load balancing for MoE layers."""
+     eplb_config: EPLBConfig = Field(default_factory=EPLBConfig)

@@ -1,0 +1,118 @@
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 3840a7068..170df4aa5 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -71,6 +71,13 @@ class Sampler(nn.Module):
+         predict_bonus_token: bool = False,
+         logprobs_mode_override: LogprobsMode | None = None,
+     ) -> SamplerOutput:
++        if self._can_use_greedy_fast_path(sampling_metadata):
++            sampled = self.greedy_sample(logits).to(torch.int32)
++            return SamplerOutput(
++                sampled_token_ids=sampled.unsqueeze(-1),
++                logprobs_tensors=None,
++            )
++
+         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+         # NOTE(woosuk): Use the original logits (before any penalties or
+         # temperature scaling) for the top-k logprobs.
+@@ -128,6 +135,19 @@ class Sampler(nn.Module):
+         )
+         return sampler_output
+ 
++    @staticmethod
++    def _can_use_greedy_fast_path(
++        sampling_metadata: SamplingMetadata,
++    ) -> bool:
++        return (
++            sampling_metadata.all_greedy
++            and sampling_metadata.max_num_logprobs is None
++            and sampling_metadata.no_penalties
++            and sampling_metadata.allowed_token_ids_mask is None
++            and not sampling_metadata.bad_words_token_ids
++            and not sampling_metadata.logitsprocs.non_argmax_invariant
++        )
++
+     @staticmethod
+     def apply_temperature(
+         logits: torch.Tensor,
+diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
+index 591f49761..ff4e1b65f 100644
+--- a/vllm/v1/worker/block_table.py
++++ b/vllm/v1/worker/block_table.py
+@@ -69,6 +69,9 @@ class BlockTable:
+             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
+         )
+         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
++        # Track the smallest interval containing rows changed on the CPU.
++        self._dirty_row_start = max_num_reqs
++        self._dirty_row_end = 0
+ 
+         self.slot_mapping = self._make_buffer(
+             self.max_num_batched_tokens, dtype=torch.int64
+@@ -97,6 +100,10 @@ class BlockTable:
+             self.dcp_rank = 0
+         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+ 
++    def _mark_row_dirty(self, row_idx: int) -> None:
++        self._dirty_row_start = min(self._dirty_row_start, row_idx)
++        self._dirty_row_end = max(self._dirty_row_end, row_idx + 1)
++
+     def append_row(
+         self,
+         block_ids: list[int],
+@@ -114,6 +121,7 @@ class BlockTable:
+         start = self.num_blocks_per_row[row_idx]
+         self.num_blocks_per_row[row_idx] += num_blocks
+         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
++        self._mark_row_dirty(row_idx)
+ 
+     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+         self.num_blocks_per_row[row_idx] = 0
+@@ -124,11 +132,14 @@ class BlockTable:
+         block_table_np = self.block_table.np
+         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
+         self.num_blocks_per_row[tgt] = num_blocks
++        self._mark_row_dirty(tgt)
+ 
+     def swap_row(self, src: int, tgt: int) -> None:
+         src_tgt, tgt_src = [src, tgt], [tgt, src]
+         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
+         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
++        self._mark_row_dirty(src)
++        self._mark_row_dirty(tgt)
+ 
+     def compute_slot_mapping(
+         self, req_indices: np.ndarray, positions: np.ndarray
+@@ -191,7 +202,21 @@ class BlockTable:
+             )
+ 
+     def commit_block_table(self, num_reqs: int) -> None:
+-        self.block_table.copy_to_gpu(num_reqs)
++        copy_start = self._dirty_row_start
++        copy_end = min(self._dirty_row_end, num_reqs)
++        if copy_start >= copy_end:
++            return
++
++        self.block_table.gpu[copy_start:copy_end].copy_(
++            self.block_table.cpu[copy_start:copy_end], non_blocking=True
++        )
++
++        # Keep dirty rows beyond the active batch pending for a later commit.
++        if copy_end == self._dirty_row_end:
++            self._dirty_row_start = self.max_num_reqs
++            self._dirty_row_end = 0
++        else:
++            self._dirty_row_start = copy_end
+ 
+     def commit_slot_mapping(self, num_tokens: int) -> None:
+         self.slot_mapping.copy_to_gpu(num_tokens)
+@@ -199,6 +224,8 @@ class BlockTable:
+     def clear(self) -> None:
+         self.block_table.gpu.fill_(0)
+         self.block_table.cpu.fill_(0)
++        self._dirty_row_start = self.max_num_reqs
++        self._dirty_row_end = 0
+ 
+     @staticmethod
+     def map_to_kernel_blocks(

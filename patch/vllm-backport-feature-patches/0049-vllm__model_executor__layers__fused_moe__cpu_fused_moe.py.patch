@@ -1,0 +1,13 @@
+diff --git a/vllm/model_executor/layers/fused_moe/cpu_fused_moe.py b/vllm/model_executor/layers/fused_moe/cpu_fused_moe.py
+index f220a2fdda24352bb190f5196eea55f990e6b7c7..72e9db514a8fd3ffea130175bf4c778d51ecc797 100644
+--- a/vllm/model_executor/layers/fused_moe/cpu_fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/cpu_fused_moe.py
+@@ -280,7 +280,7 @@ class CPUFusedMOE:
+         if not (w13_output_size % 32 == 0 and w2_output_size % 32 == 0):
+             return False, "none"
+ 
+-        supports_amx = torch._C._cpu._is_amx_tile_supported()
++        supports_amx = torch.cpu._is_amx_tile_supported()
+ 
+         if (
+             supports_amx

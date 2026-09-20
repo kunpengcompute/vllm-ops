@@ -1,0 +1,12 @@
+diff --git a/tests/entrypoints/openai/test_completion_error.py b/tests/entrypoints/openai/test_completion_error.py
+index 1e7a3d0a8c3943afc48ada6994af68ca5599c77a..6a96c2bd7f754cdda319091808f1b9ea50d4bcc6 100644
+--- a/tests/entrypoints/openai/test_completion_error.py
++++ b/tests/entrypoints/openai/test_completion_error.py
+@@ -54,6 +54,7 @@ class MockModelConfig:
+     skip_tokenizer_init = False
+     is_encoder_decoder: bool = False
+     is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
+ 
+     def get_diff_sampling_param(self):
+         return self.diff_sampling_param or {}

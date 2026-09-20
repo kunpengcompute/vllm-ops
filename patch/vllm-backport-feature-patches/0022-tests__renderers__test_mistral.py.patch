@@ -1,0 +1,12 @@
+diff --git a/tests/renderers/test_mistral.py b/tests/renderers/test_mistral.py
+index 40235491d8c1a351f805de40746612a6bfb14ee7..8a6a8828ab098ef453579c449bc0e1a1979d3fe8 100644
+--- a/tests/renderers/test_mistral.py
++++ b/tests/renderers/test_mistral.py
+@@ -37,6 +37,7 @@ class MockModelConfig:
+     skip_tokenizer_init: bool = False
+     is_encoder_decoder: bool = False
+     is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
+ 
+ 
+ @dataclass

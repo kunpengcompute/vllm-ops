@@ -1,0 +1,22 @@
+diff --git a/vllm/renderers/mistral.py b/vllm/renderers/mistral.py
+index feea19fba275af1981156d2af0cb36c2c23ebd34..d94302864b3518b604a98daa28d528d90311881d 100644
+--- a/vllm/renderers/mistral.py
++++ b/vllm/renderers/mistral.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from concurrent.futures import ThreadPoolExecutor
+ from typing import Any
+ 
+ from vllm.config import VllmConfig
+@@ -75,9 +74,8 @@ class MistralRenderer(BaseRenderer[MistralTokenizer]):
+     ) -> None:
+         super().__init__(config, tokenizer)
+ 
+-        self._apply_chat_template_executor = ThreadPoolExecutor(max_workers=1)
+         self._apply_chat_template_async = make_async(
+-            safe_apply_chat_template, executor=self._apply_chat_template_executor
++            safe_apply_chat_template, executor=self._executor
+         )
+ 
+     def render_messages(

@@ -1,0 +1,39 @@
+diff --git a/tests/renderers/test_completions.py b/tests/renderers/test_completions.py
+index 492f539e44defc2462cb75db764631ccd64b459e..7681d31f5dc87a352c46d91536c919cfc95e44cc 100644
+--- a/tests/renderers/test_completions.py
++++ b/tests/renderers/test_completions.py
+@@ -39,6 +39,7 @@ class MockModelConfig:
+     skip_tokenizer_init: bool = False
+     is_encoder_decoder: bool = False
+     is_multimodal_model: bool = False
++    renderer_num_workers: int = 1
+ 
+ 
+ @dataclass
+@@ -271,7 +272,7 @@ class TestRenderPrompt:
+ 
+         with pytest.raises(
+             ValueError,
+-            match="input characters and requested .* context length is only",
++            match="maximum context length is",
+         ):
+             renderer.tokenize_prompts(
+                 prompts,
+@@ -292,7 +293,7 @@ class TestRenderPrompt:
+ 
+         with pytest.raises(
+             ValueError,
+-            match="input tokens and requested .* context length is only",
++            match="maximum context length is",
+         ):
+             renderer.tokenize_prompts(
+                 prompts,
+@@ -313,7 +314,7 @@ class TestRenderPrompt:
+ 
+         with pytest.raises(
+             ValueError,
+-            match="input tokens and requested .* context length is only",
++            match="maximum context length is",
+         ):
+             renderer.tokenize_prompts(
+                 prompts,

@@ -1,0 +1,29 @@
+diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
+index 7bada5e7ca3ce720176ce62573ca1de50841612d..3927ca5f1e001d0840ff4a0514b5ba47c352a56c 100644
+--- a/vllm/compilation/cuda_graph.py
++++ b/vllm/compilation/cuda_graph.py
+@@ -176,6 +176,7 @@ class CUDAGraphWrapper:
+ 
+         self.first_run_finished = False
+         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
++        self._runnable_str = str(runnable) if self.is_debugging_mode else None
+ 
+         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
+         # need to initialize a CUDAGraphWrapper.
+@@ -196,10 +197,12 @@ class CUDAGraphWrapper:
+         # allow accessing the attributes of the runnable.
+         if hasattr(self.runnable, key):
+             return getattr(self.runnable, key)
+-        raise AttributeError(
+-            f"Attribute {key} not exists in the runnable of "
+-            f"cudagraph wrapper: {self.runnable}"
+-        )
++        if self.is_debugging_mode:
++            raise AttributeError(
++                f"Attribute {key} not exists in the runnable of "
++                f"cudagraph wrapper: {self._runnable_str}"
++            )
++        raise AttributeError
+ 
+     def unwrap(self) -> Callable[..., Any]:
+         # in case we need to access the original runnable.

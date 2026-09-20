@@ -1,0 +1,12 @@
+diff --git a/vllm/entrypoints/openai/run_batch.py b/vllm/entrypoints/openai/run_batch.py
+index 69c326ce1561ec46b0074746098ea8a8c78f06b4..072eaccc9da7d6c321f2829a8c7f5bc887a0fd3c 100644
+--- a/vllm/entrypoints/openai/run_batch.py
++++ b/vllm/entrypoints/openai/run_batch.py
+@@ -319,6 +319,7 @@ class BatchProgressTracker:
+ async def read_file(path_or_url: str) -> str:
+     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+         async with aiohttp.ClientSession() as session, session.get(path_or_url) as resp:
++            resp.raise_for_status()
+             return await resp.text()
+     else:
+         with open(path_or_url, encoding="utf-8") as f:
