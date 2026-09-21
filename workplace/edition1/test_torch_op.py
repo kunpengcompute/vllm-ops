@@ -23,7 +23,7 @@ script_dir = pathlib.Path(__file__).resolve().parent
 search_paths = [
     script_dir / "../../vllm/csrc/cpu/openvla_image_preprocess.cpp",
     script_dir / "../../../vllm/csrc/cpu/openvla_image_preprocess.cpp",
-    pathlib.Path("/home/j50058823/openvla/vllm/csrc/cpu/openvla_image_preprocess.cpp"),
+    pathlib.Path("/home/user/openvla/vllm/csrc/cpu/openvla_image_preprocess.cpp"),
 ]
 cpp_path = None
 for p in search_paths:
