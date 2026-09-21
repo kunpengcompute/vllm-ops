@@ -10,7 +10,7 @@ This document targets the inference scenario on the MetaX C500 GPU. It uses the 
 - Software platform: install the MetaX driver matching the container; use the vLLM 0.15.0 container provided by MetaX, which already contains the MACA-SDK, PyTorch, and source-build dependencies. Prepare the base container image yourself.
 - Python version: 3.12.
 - Target software versions: vLLM 0.17.0 and vLLM-MetaX 0.17.0. The 0.15.0 container is only used as the build base environment; the vLLM 0.15.0 preinstalled in the container cannot be used to run these patches.
-- Network: the build pulls source from [GitCode](https://gitcode.com/boostkit/vllm-ops) and [GitHub](https://github.com), so the container needs network access (see [step 1](#step1)).
+- Network: the build pulls source from [AtomGit](https://atomgit.com/boostkit/vllm-ops) and [GitHub](https://github.com), so the container needs network access (see [step 1](#step1)).
 - Model selection: [Qwen3-32B](https://modelscope.cn/models/Qwen/Qwen3-32B).
 
 ## Optimization Patches
@@ -52,7 +52,7 @@ The following uses `/home/code` as an example. The following command pulls this 
 ```bash
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
-git clone https://gitcode.com/boostkit/vllm-ops.git vllm-ops
+git clone https://atomgit.com/boostkit/vllm-ops.git vllm-ops
 export OPS_DIR="$WORK_DIR/vllm-ops"
 ```
 
