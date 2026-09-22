@@ -10,7 +10,7 @@
 - 系统要求：安装与容器匹配的沐曦驱动；使用沐曦提供的vLLM 0.15.0容器，容器内已包含MACA-SDK、PyTorch及源码编译依赖环境。基础容器镜像请自行准备。
 - Python版本：3.12。
 - 目标软件版本：vLLM 0.17.0、vLLM-MetaX 0.17.0；0.15.0容器仅作为编译基础环境，不能继续使用容器内预装的vLLM 0.15.0运行本补丁。
-- 网络：编译过程需从[GitCode](https://gitcode.com/boostkit/vllm-ops)与[GitHub](https://github.com)拉取源码，容器需能访问网络（见[步骤1](#step1)）。
+- 网络：编译过程需从[AtomGit](https://atomgit.com/boostkit/vllm-ops)与[GitHub](https://github.com)拉取源码，容器需能访问网络（见[步骤1](#step1)）。
 - 模型选择：[Qwen3-32B模型](https://modelscope.cn/models/Qwen/Qwen3-32B)。
 
 ## 适配优化补丁
@@ -52,7 +52,7 @@
 ```bash
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
-git clone https://gitcode.com/boostkit/vllm-ops.git vllm-ops
+git clone https://atomgit.com/boostkit/vllm-ops.git vllm-ops
 export OPS_DIR="$WORK_DIR/vllm-ops"
 ```
 
