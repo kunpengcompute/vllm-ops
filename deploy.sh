@@ -15,7 +15,7 @@
 
 set -e
 
-VLLM_DIR="${1:?请指定 vLLM 源码目录, 例如: bash deploy.sh /home/j50058823/openvla/vllm}"
+VLLM_DIR="${1:?请指定 vLLM 源码目录}"
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== OpenVLA 前处理 NEON 加速 — 部署 ==="

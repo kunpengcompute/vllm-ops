@@ -6,14 +6,16 @@
 用法: python3 bench_all.py
 """
 
-import ctypes, sys, time
+import ctypes
+import time
+
 import numpy as np
 from PIL import Image
 
 IMAGENET_MEAN = np.array([0.484375, 0.455078125, 0.40625], dtype=np.float32)
-IMAGENET_STD  = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
+IMAGENET_STD = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
 SIGLIP_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-SIGLIP_STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+SIGLIP_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
 SO_PATH = "../libpreprocess.so"
 
@@ -46,7 +48,12 @@ def accelerated_preprocess(pixels, iters, num_threads):
 
     lib = ctypes.CDLL(SO_PATH)
     lib.combined_preprocess.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
     lib.combined_preprocess.restype = None
 
     ptr_in = pixels.ctypes.data_as(ctypes.c_void_p)
@@ -65,10 +72,14 @@ def main():
     rng = np.random.RandomState(42)
 
     # 表头
-    print("| 尺寸 | 原版(ms) | t=1(ms) | t=4(ms) | t=8(ms) | t=16(ms) | t=32(ms) | "
-          "加速比(16t) | max_err |")
-    print("|------|----------|---------|---------|---------|----------|----------|"
-          "------------|---------|")
+    print(
+        "| 尺寸 | 原版(ms) | t=1(ms) | t=4(ms) | t=8(ms) | t=16(ms) | t=32(ms) | "
+        "加速比(16t) | max_err |"
+    )
+    print(
+        "|------|----------|---------|---------|---------|----------|----------|"
+        "------------|---------|"
+    )
 
     for w, h, label in SIZES:
         pixels = rng.randint(0, 256, (h, w, 3), dtype=np.uint8)
@@ -94,10 +105,12 @@ def main():
 
         best_t = 16
         speedup = orig_ms / neon_ms[best_t]
-        print(f"| {label:<12s} | {orig_ms:>8.3f} | {neon_ms[1]:>7.3f} | "
-              f"{neon_ms[4]:>7.3f} | {neon_ms[8]:>7.3f} | "
-              f"{neon_ms[16]:>8.3f} | {neon_ms[32]:>8.3f} | "
-              f"{speedup:>10.1f}× | {max_err:>7.2e} |")
+        print(
+            f"| {label:<12s} | {orig_ms:>8.3f} | {neon_ms[1]:>7.3f} | "
+            f"{neon_ms[4]:>7.3f} | {neon_ms[8]:>7.3f} | "
+            f"{neon_ms[16]:>8.3f} | {neon_ms[32]:>8.3f} | "
+            f"{speedup:>10.1f}× | {max_err:>7.2e} |"
+        )
 
     # 分解表
     print()
@@ -111,27 +124,32 @@ def main():
     iters = 50
 
     t0 = time.perf_counter()
-    for _ in range(iters): _ = img.resize((224, 224), Image.Resampling.BICUBIC)
+    for _ in range(iters):
+        _ = img.resize((224, 224), Image.Resampling.BICUBIC)
     t_resize = (time.perf_counter() - t0) / iters * 1000
 
     r = img.resize((224, 224), Image.Resampling.BICUBIC)
     t0 = time.perf_counter()
-    for _ in range(iters): raw = np.asarray(r, dtype=np.float32) / 255.0
+    for _ in range(iters):
+        raw = np.asarray(r, dtype=np.float32) / 255.0
     t_div = (time.perf_counter() - t0) / iters * 1000
 
     raw = np.asarray(r, dtype=np.float32) / 255.0
     t0 = time.perf_counter()
-    for _ in range(iters): d = ((raw - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
+    for _ in range(iters):
+        d = ((raw - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
     t_dino = (time.perf_counter() - t0) / iters * 1000
 
     t0 = time.perf_counter()
-    for _ in range(iters): s = ((raw - SIGLIP_MEAN) / SIGLIP_STD).transpose(2, 0, 1)
+    for _ in range(iters):
+        s = ((raw - SIGLIP_MEAN) / SIGLIP_STD).transpose(2, 0, 1)
     t_sig = (time.perf_counter() - t0) / iters * 1000
 
     d = ((raw - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
     s = ((raw - SIGLIP_MEAN) / SIGLIP_STD).transpose(2, 0, 1)
     t0 = time.perf_counter()
-    for _ in range(iters): _ = np.concatenate([d, s], axis=0)
+    for _ in range(iters):
+        _ = np.concatenate([d, s], axis=0)
     t_cat = (time.perf_counter() - t0) / iters * 1000
 
     total = t_resize + t_div + t_dino + t_sig + t_cat
@@ -144,7 +162,7 @@ def main():
         ("concatenate", t_cat, "C++ 直接写 6 平面, 零开销"),
     ]
     for name, ms, opt in steps:
-        print(f"| {name:<25s} | {ms:>8.3f} | {ms/total*100:>5.1f}% | {opt:<45s} |")
+        print(f"| {name:<25s} | {ms:>8.3f} | {ms / total * 100:>5.1f}% | {opt:<45s} |")
     print(f"| {'**总计**':<25s} | **{total:>7.3f}** | | |")
 
 

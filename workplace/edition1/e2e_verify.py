@@ -5,14 +5,16 @@
 用法: python3 e2e_verify.py
 """
 
-import ctypes, sys
+import ctypes
+import sys
+
 import numpy as np
 from PIL import Image
 
 IMAGENET_MEAN = np.array([0.484375, 0.455078125, 0.40625], dtype=np.float32)
-IMAGENET_STD  = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
+IMAGENET_STD = np.array([0.228515625, 0.2236328125, 0.224609375], dtype=np.float32)
 SIGLIP_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-SIGLIP_STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+SIGLIP_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
 SO_PATH = "../libpreprocess.so"
 
@@ -44,13 +46,20 @@ def accelerated(pixels, nthreads):
     out = np.empty((6, 224, 224), dtype=np.float32)
     lib = ctypes.CDLL(SO_PATH)
     lib.combined_preprocess.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
     lib.combined_preprocess.restype = None
     lib.combined_preprocess(
         pixels.ctypes.data_as(ctypes.c_void_p),
         out.ctypes.data_as(ctypes.c_void_p),
-        h, w, nthreads)
+        h,
+        w,
+        nthreads,
+    )
     return out
 
 
@@ -58,8 +67,10 @@ def main():
     rng = np.random.RandomState(42)
     all_ok = True
 
-    print(f"{'尺寸':>14s}  {'max_err':>10s}  {'err>0.01':>9s}  "
-          f"{'DINOv2 max':>11s}  {'SigLIP max':>11s}  {'结果':>5s}")
+    print(
+        f"{'尺寸':>14s}  {'max_err':>10s}  {'err>0.01':>9s}  "
+        f"{'DINOv2 max':>11s}  {'SigLIP max':>11s}  {'结果':>5s}"
+    )
     print("-" * 72)
 
     for w, h, label in SIZES:
@@ -79,13 +90,16 @@ def main():
         if not ok:
             all_ok = False
 
-        print(f"{label:>8s} {w}×{h:<6d}  {max_err:>10.2e}  {n_big:>9d}  "
-              f"{dino_max:>11.2e}  {siglip_max:>11.2e}  {'OK':>5s}" if ok
-              else f"{'FAIL':>5s}")
+        print(
+            f"{label:>8s} {w}×{h:<6d}  {max_err:>10.2e}  {n_big:>9d}  "
+            f"{dino_max:>11.2e}  {siglip_max:>11.2e}  {'OK':>5s}"
+            if ok
+            else f"{'FAIL':>5s}"
+        )
 
     print("-" * 72)
     print(f"\n{'[OK] 全部通过' if all_ok else '[FAIL] 存在差异'}")
-    print(f"容忍度: max_err ≤ 0.02 (≈ 1-pixel uint8 × scale 因子)")
+    print("容忍度: max_err ≤ 0.02 (≈ 1-pixel uint8 × scale 因子)")
     return all_ok
 
 

@@ -34,14 +34,15 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def section(title: str) -> None:
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {title}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 测试 1: 算子注册
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def test_op_registration() -> bool:
     """检查 torch.ops._C.openvla_fused_preprocess 是否已注册."""
@@ -49,8 +50,9 @@ def test_op_registration() -> bool:
 
     try:
         import torch
+        from vllm.transformers_utils.processors import openvla
+
         import vllm  # noqa: F401
-        from vllm.transformers_utils.processors import openvla  # noqa: F401
     except ImportError as e:
         check("Import vllm", False, str(e))
         return False
@@ -76,6 +78,7 @@ def test_op_registration() -> bool:
 # 测试 2: 端到端功能
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_end_to_end() -> None:
     """端到端测试: 输入图片 → 输出 tensor."""
     section("Test 2/4: End-to-End")
@@ -87,10 +90,10 @@ def test_end_to_end() -> None:
 
     # 测试不同尺寸的图片
     test_sizes = [
-        (224, 224),   # 无需 resize
-        (100, 150),   # 需要 resize
-        (480, 640),   # 大图 resize
-        (50, 200),    # 窄图
+        (224, 224),  # 无需 resize
+        (100, 150),  # 需要 resize
+        (480, 640),  # 大图 resize
+        (50, 200),  # 窄图
     ]
 
     for h, w in test_sizes:
@@ -103,7 +106,10 @@ def test_end_to_end() -> None:
                 and tuple(result.shape) == (6, 224, 224)
                 and str(result.dtype) == "torch.float32"
             )
-            check(f"Input [{h},{w},3] → [{result.shape[0]},{result.shape[1]},{result.shape[2]}]", ok)
+            check(
+                f"Input [{h},{w},3] → [{result.shape[0]},{result.shape[1]},{result.shape[2]}]",
+                ok,
+            )
         except Exception as e:
             check(f"Input [{h},{w},3]", False, str(e))
 
@@ -111,6 +117,7 @@ def test_end_to_end() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 # 测试 3: 与 NumPy 参考实现精度对比
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def test_numpy_cross_check() -> None:
     """对比 NEON kernel 输出与 NumPy 参考实现的精度."""
@@ -183,6 +190,7 @@ def test_numpy_cross_check() -> None:
 # 测试 4: Python fallback 路径
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_fallback() -> None:
     """验证 NEON kernel 不可用时 Python fallback 正常工作."""
     section("Test 4/4: Python Fallback")
@@ -216,6 +224,7 @@ def test_fallback() -> None:
 # 性能基准 (可选)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def bench() -> None:
     """NEON vs NumPy 性能对比."""
     section("Benchmark: NEON vs NumPy")
@@ -246,14 +255,15 @@ def bench() -> None:
     neon_time = (time.perf_counter() - t0) / 50
 
     speedup = numpy_time / neon_time if neon_time > 0 else float("inf")
-    print(f"  NumPy: {numpy_time*1000:.2f} ms/image")
-    print(f"  NEON:  {neon_time*1000:.2f} ms/image")
+    print(f"  NumPy: {numpy_time * 1000:.2f} ms/image")
+    print(f"  NEON:  {neon_time * 1000:.2f} ms/image")
     print(f"  Speedup: {speedup:.1f}×")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 主入口
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def main() -> None:
     print("=" * 60)

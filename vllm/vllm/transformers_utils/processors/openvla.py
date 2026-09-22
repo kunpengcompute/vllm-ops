@@ -24,27 +24,25 @@ _neon_available = False
 _c_fn = None
 
 try:
-    import vllm._C  # noqa: F401  触发 _C.abi3.so 加载
     import torch.library
+    import vllm._C
 
     # 加载 extern "C" 内核函数
     _so_path = vllm._C.__file__
     _c_lib = ctypes.CDLL(_so_path)
     _c_lib.openvla_fused_preprocess_c.argtypes = [
-        ctypes.c_void_p,           # input: uint8_t*
-        ctypes.c_int,              # H
-        ctypes.c_int,              # W
-        ctypes.c_void_p,           # output: float*
-        ctypes.c_int64,            # num_threads
+        ctypes.c_void_p,  # input: uint8_t*
+        ctypes.c_int,  # H
+        ctypes.c_int,  # W
+        ctypes.c_void_p,  # output: float*
+        ctypes.c_int64,  # num_threads
     ]
     _c_lib.openvla_fused_preprocess_c.restype = None
     _c_fn = _c_lib.openvla_fused_preprocess_c
 
     # 注册 torch 算子
     _lib = torch.library.Library("_C", "FRAGMENT")
-    _lib.define(
-        "openvla_fused_preprocess(Tensor input, int num_threads=4) -> Tensor"
-    )
+    _lib.define("openvla_fused_preprocess(Tensor input, int num_threads=4) -> Tensor")
 
     @torch.library.impl(_lib, "openvla_fused_preprocess", "CPU")
     def _neon_kernel(input: torch.Tensor, num_threads: int = 4) -> torch.Tensor:
@@ -64,10 +62,12 @@ except Exception:
 # Python fallback (全平台通用)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def _openvla_preprocess_python(image: Any, image_size: int) -> torch.Tensor:
     """纯 NumPy 参考实现."""
     rgb_image = image.resize(
-        (image_size, image_size), Image.Resampling.BICUBIC,
+        (image_size, image_size),
+        Image.Resampling.BICUBIC,
     )
     raw = np.asarray(rgb_image, dtype=np.float32) / 255.0
     dinov2_pixels = ((raw - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
@@ -79,6 +79,7 @@ def _openvla_preprocess_python(image: Any, image_size: int) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════════════════
 # OpenVLA image processor
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def to_rgb_image(image: Any) -> Image.Image:
     if isinstance(image, Image.Image):

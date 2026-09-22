@@ -374,11 +374,14 @@ static inline void store_block_to_outputs(
 static void neon_normalize(
     const uint8_t* resized, float* output, int num_threads)
 {
-    // 6 路输出 — DINOv2 (d) + SigLIP (s)
+    // 6 路输出 — DINOv2 (d) + SigLIP (s), 每路占 kOutputPlane floats.
+    // Fix for issue #9: 与 vllm/csrc/cpu/openvla_image_preprocess.cpp 同源 bug.
+    // 原 d[B] = output + kInputChannels * kOutputPlane = output + 3*plane 与
+    // s[R] = output + 3*plane 重叠, 导致 d[B] 通道被 s[R] 覆盖.
     OutputPlanes planes;
-    planes.d[kChannelR] = output;
-    planes.d[kChannelG] = output + kOutputPlane;
-    planes.d[kChannelB] = output + kInputChannels * kOutputPlane;  // 2 * kOutputPlane
+    planes.d[kChannelR] = output + kChannelR * kOutputPlane;          // 0 * plane
+    planes.d[kChannelG] = output + kChannelG * kOutputPlane;          // 1 * plane
+    planes.d[kChannelB] = output + kChannelB * kOutputPlane;          // 2 * plane
     planes.s[kChannelR] = output + (kInputChannels + kChannelR) * kOutputPlane;  // 3 *
     planes.s[kChannelG] = output + (kInputChannels + kChannelG) * kOutputPlane;  // 4 *
     planes.s[kChannelB] = output + (kInputChannels + kChannelB) * kOutputPlane;  // 5 *
